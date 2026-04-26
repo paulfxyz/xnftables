@@ -1,0 +1,84 @@
+# =============================================================================
+# 00-tables.nft — Table definitions and base chain policies
+# =============================================================================
+# We use a single "inet" table which covers both IPv4 and IPv6 in one place.
+# Three base chains:
+#   input   — packets destined for THIS host
+#   forward — packets routed THROUGH this host (disable if not a router)
+#   output  — packets originating FROM this host (permissive by default)
+#
+# Default policies are DROP for input and forward.
+# Output is ACCEPT because we trust outbound traffic from root/services.
+# If you want zero-trust egress too, change output policy to drop and
+# add explicit output rules for each service (DNS, NTP, package managers…).
+# =============================================================================
+
+table inet filter {
+
+    # -------------------------------------------------------------------------
+    # Named sets — edit these to match your topology
+    # -------------------------------------------------------------------------
+
+    # All mesh peer addresses (WireGuard assigned IPs).
+    # vpn.yourdomain.com assigns peers from 10.10.0.0/24.
+    # Add individual IPs here if you want per-peer granularity.
+    set MESH_PEERS {
+        type ipv4_addr
+        flags interval
+        # The full mesh subnet — every node that completed the WireGuard handshake
+        # and received an IP from your VPN server lives in this range.
+        elements = { 10.10.0.0/24 }
+    }
+
+    # IPv6 mesh peers (if your WireGuard server assigns v6 addresses)
+    set MESH_PEERS6 {
+        type ipv6_addr
+        flags interval
+        # Example: fd00:10::/120  — replace with your actual prefix or leave empty
+        # elements = { fd00:10::/120 }
+    }
+
+    # Trusted admin IPs that may SSH into the host even outside the mesh.
+    # Keep this empty unless absolutely necessary — prefer mesh-only access.
+    set ADMIN_ALLOWLIST {
+        type ipv4_addr
+        flags interval
+        # elements = { 203.0.113.42 }   # example: office egress IP
+    }
+
+    # -------------------------------------------------------------------------
+    # Base chains
+    # -------------------------------------------------------------------------
+
+    chain input {
+        # Explicit DROP policy — nothing arrives unless a rule above permits it
+        type filter hook input priority filter; policy drop;
+    }
+
+    chain forward {
+        # DROP by default — this host is not a transit router.
+        # If you run a WireGuard server that routes between peers, replace with:
+        #   oifname "wg0" accept  (mesh-to-mesh forwarding)
+        #   iifname "wg0" accept
+        type filter hook forward priority filter; policy drop;
+    }
+
+    chain output {
+        # ACCEPT — we trust traffic originating on this host.
+        # Tighten to drop + explicit rules for paranoid egress control.
+        type filter hook output priority filter; policy accept;
+    }
+
+    # -------------------------------------------------------------------------
+    # Sub-chains called from the base chains above
+    # (populated by the subsequent include files)
+    # -------------------------------------------------------------------------
+
+    chain mesh_input {
+        # Traffic arriving from WireGuard peers — populated by 20-mesh.nft
+    }
+
+    chain services {
+        # Per-service allowlist — populated by 40-services.nft
+    }
+}

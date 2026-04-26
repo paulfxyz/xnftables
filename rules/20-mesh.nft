@@ -1,0 +1,63 @@
+# =============================================================================
+# 20-mesh.nft — WireGuard mesh trust boundary
+# =============================================================================
+# This is the CORE of the policy.  Traffic is split into two worlds:
+#
+#   World A — arrived through the WireGuard tunnel (wg0):
+#             These packets come from authenticated peers.  WireGuard's
+#             cryptographic handshake guarantees the sender holds the
+#             private key that matches a pre-authorised public key on
+#             the server.  We jump to the "mesh_input" sub-chain where
+#             per-service rules live.
+#
+#   World B — everything else (eth0, the public internet):
+#             Unconditionally dropped (logged first by 70-logging.nft).
+#
+# Why trust wg0 at the interface level and not just the source IP?
+#   Source IPs can be spoofed on the public internet.
+#   A packet exiting wg0 has ALREADY been decrypted with the session key —
+#   it cannot have been forged by a non-peer.  Interface-level trust is
+#   therefore cryptographically sound for WireGuard.
+#
+# Topology assumed:
+#   WireGuard interface : wg0
+#   VPN server FQDN     : vpn.yourdomain.com
+#   Mesh CIDR (IPv4)    : 10.10.0.0/24
+#   Server's mesh IP    : 10.10.0.1
+#   Peer range          : 10.10.0.2 – 10.10.0.254
+#
+# To use a different interface name (e.g. wg1, tailscale0, utun*):
+#   Change every "wg0" reference below.
+# =============================================================================
+
+table inet filter {
+    chain input {
+        # --- WireGuard tunnel: jump to per-service allowlist ---
+        # Packets decrypted out of wg0 are trusted mesh traffic.
+        # We jump (not goto) so un-matched packets fall through to the
+        # log+drop rules in chain input after mesh_input returns.
+        iifname "wg0" jump mesh_input comment "mesh: enter service allowlist"
+
+        # Explicit source-IP guard inside the tunnel (defence-in-depth).
+        # Should never fire under normal operation — if it does, a peer is
+        # sending traffic from an IP outside its assigned range, which is
+        # suspicious and should be investigated.
+        iifname "wg0" ip saddr != @MESH_PEERS \
+            log prefix "XNFT-MESH-SPOOF: " level warn \
+            drop comment "mesh: drop spoofed source IP inside tunnel"
+    }
+
+    chain mesh_input {
+        # Source-address validation: ensure the decrypted packet's source IP
+        # actually belongs to a known mesh peer.
+        # This catches misconfigured AllowedIPs on the WireGuard server side.
+        ip saddr @MESH_PEERS jump services comment "mesh: known peer → services"
+
+        # IPv6 mesh peers (uncomment if using v6 addressing in the mesh)
+        # ip6 saddr @MESH_PEERS6 jump services comment "mesh: known peer (v6) → services"
+
+        # Anything else that somehow exits wg0 with a non-mesh source IP:
+        log prefix "XNFT-MESH-UNKNOWN: " level warn drop \
+            comment "mesh: unknown source, drop"
+    }
+}

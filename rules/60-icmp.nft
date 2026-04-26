@@ -1,0 +1,87 @@
+# =============================================================================
+# 60-icmp.nft — Controlled ICMP policy
+# =============================================================================
+# Blanket ICMP drops break things silently: path MTU discovery fails,
+# traceroute stops working, and some TCP implementations hang waiting for
+# ICMP unreachable messages that never arrive.
+#
+# Policy:
+#   - Echo-request (ping) allowed FROM mesh peers only
+#   - Essential ICMP types allowed from everywhere (type 3 dest-unreachable,
+#     type 11 time-exceeded) — required for PMTUD and sane TCP behaviour
+#   - ICMPv6 Neighbour Discovery always allowed (IPv6 requires it)
+#   - Everything else: log and drop
+#
+# ICMP types reference (IPv4):
+#   0  echo-reply           — ping reply
+#   3  destination-unreachable — port closed, host unreachable, frag-needed (PMTUD)
+#   8  echo-request         — ping
+#   11 time-exceeded        — TTL expired (traceroute)
+# =============================================================================
+
+table inet filter {
+    chain input {
+
+        # -------------------------------------------------------------------
+        # IPv4 ICMP
+        # -------------------------------------------------------------------
+
+        # Ping from mesh peers — allowed, useful for diagnostics
+        ip protocol icmp icmp type echo-request \
+            ip saddr @MESH_PEERS \
+            limit rate 10/second \
+            accept comment "icmp4: ping from mesh peers"
+
+        # Essential ICMP types — required regardless of source
+        # frag-needed (type 3 code 4) is critical for Path MTU Discovery.
+        # Without it, connections over certain tunnels silently stall.
+        ip protocol icmp icmp type {
+            destination-unreachable,
+            time-exceeded
+        } accept comment "icmp4: essential types (PMTUD, traceroute)"
+
+        # ICMP echo-reply for connections we initiated (handled by conntrack
+        # in 30-established.nft, but explicit here for clarity)
+        ip protocol icmp icmp type echo-reply \
+            ct state { established, related } \
+            accept comment "icmp4: echo-reply for our pings"
+
+        # Drop all other ICMP from the public internet
+        ip protocol icmp \
+            log prefix "XNFT-ICMP4-DROP: " \
+            drop comment "icmp4: drop unmatched"
+
+        # -------------------------------------------------------------------
+        # IPv6 ICMP (ICMPv6)
+        # -------------------------------------------------------------------
+
+        # Neighbour Discovery Protocol — MUST be allowed for IPv6 to function.
+        # NDP replaces ARP and is essential for address autoconfiguration.
+        # Types 133–137: Router Solicitation/Advertisement, Neighbour Sol/Adv, Redirect
+        ip6 nexthdr icmpv6 icmpv6 type {
+            nd-router-solicit,
+            nd-router-advert,
+            nd-neighbor-solicit,
+            nd-neighbor-advert,
+            nd-redirect
+        } accept comment "icmp6: NDP (required for IPv6)"
+
+        # ICMPv6 destination-unreachable and time-exceeded (same reasons as v4)
+        ip6 nexthdr icmpv6 icmpv6 type {
+            destination-unreachable,
+            time-exceeded,
+            packet-too-big
+        } accept comment "icmp6: essential types (PMTUD, traceroute)"
+
+        # Ping from mesh peers (v6)
+        ip6 nexthdr icmpv6 icmpv6 type echo-request \
+            ip6 saddr @MESH_PEERS6 \
+            limit rate 10/second \
+            accept comment "icmp6: ping from mesh peers"
+
+        # Drop all other ICMPv6
+        ip6 nexthdr icmpv6 \
+            log prefix "XNFT-ICMP6-DROP: " \
+            drop comment "icmp6: drop unmatched"
+    }
+}

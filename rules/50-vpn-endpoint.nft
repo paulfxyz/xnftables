@@ -1,0 +1,43 @@
+# =============================================================================
+# 50-vpn-endpoint.nft — WireGuard handshake port (public internet)
+# =============================================================================
+# This is the ONLY rule that allows traffic from the public internet.
+#
+# WireGuard needs its UDP listen port reachable from the outside so that
+# peers can initiate a handshake.  Everything else — all services — remains
+# invisible to the world.
+#
+# What happens on port 51820 UDP:
+#   1. A peer sends an "Initiation" datagram (148 bytes, encrypted).
+#   2. The server responds with a "Response" datagram (92 bytes).
+#   3. Both sides derive shared session keys.
+#   4. All subsequent traffic travels through the encrypted tunnel.
+#      → Those decrypted packets exit wg0 and hit the mesh rules in 20-mesh.nft.
+#
+# A port-scanner hitting UDP/51820 will receive no response to non-WireGuard
+# datagrams (WireGuard drops anything that doesn't decrypt correctly), so the
+# port appears "open|filtered" on nmap — no information leakage.
+#
+# Rate-limiting:
+#   Handshake packets are small and infrequent (one per ~3 minutes per peer
+#   under default rekey settings).  We rate-limit to 20/minute per source IP
+#   to blunt UDP flood amplification while allowing legitimate reconnects.
+#
+# Change the port if your WireGuard server listens on a non-default port.
+# Must match ListenPort in /etc/wireguard/wg0.conf.
+# =============================================================================
+
+table inet filter {
+    chain input {
+        # Accept WireGuard handshake datagrams from anywhere.
+        # Rate-limited: max 20 new handshakes per minute per source IP.
+        udp dport 51820 \
+            limit rate 20/minute \
+            accept comment "vpn-endpoint: WireGuard handshake (public)"
+
+        # Log excessive handshake attempts (possible scan or DDoS probe).
+        udp dport 51820 \
+            log prefix "XNFT-WG-RATELIMIT: " level warn \
+            drop comment "vpn-endpoint: WireGuard handshake rate-limit exceeded"
+    }
+}

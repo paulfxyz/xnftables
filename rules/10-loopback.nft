@@ -1,0 +1,16 @@
+# =============================================================================
+# 10-loopback.nft — Loopback interface (always allow)
+# =============================================================================
+# The loopback interface (lo) carries inter-process traffic on the same host:
+# DNS stubs, Unix-socket-over-IP bridges, systemd-resolved, Docker internal
+# networking, etc.  Dropping loopback breaks many daemons silently.
+# This rule MUST come before any drop rules.
+# =============================================================================
+
+table inet filter {
+    chain input {
+        # Accept all traffic on the loopback interface unconditionally.
+        # iifname match is evaluated before conntrack — fast path.
+        iifname "lo" accept comment "loopback: always permit"
+    }
+}

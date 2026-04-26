@@ -1,0 +1,96 @@
+# =============================================================================
+# 40-services.nft — Explicit per-service allowlist (mesh peers only)
+# =============================================================================
+# Every rule here has:
+#   1. A protocol + port
+#   2. A comment naming the service
+#   3. An optional rate-limit or connection-limit for abuse prevention
+#
+# Rules in this chain only fire for packets that already passed 20-mesh.nft.
+# That means ip saddr is guaranteed to be in @MESH_PEERS — no need to repeat
+# the source check.
+#
+# HOW TO ADD A SERVICE
+# --------------------
+# 1. Uncomment the relevant block below, or copy the template at the end.
+# 2. Use the most specific match possible (proto + dport, not just dport).
+# 3. Add a comment= that names the service and its purpose.
+# 4. Reload: nft -f /etc/nftables/nftables.conf
+# 5. Verify: nft list ruleset | grep <port>
+# 6. Commit the change with a message explaining WHY it was added.
+#
+# HOW TO REMOVE A SERVICE
+# -----------------------
+# Delete or comment-out the line, reload, commit.
+# The audit trail lives in git — never just silently delete a rule.
+# =============================================================================
+
+table inet filter {
+    chain services {
+
+        # -----------------------------------------------------------------------
+        # SSH — remote shell (mesh peers only)
+        # -----------------------------------------------------------------------
+        # Only reachable from inside the mesh. Change port if you run SSH on
+        # a non-standard port (recommended: e.g. 2222).
+        tcp dport 22 accept comment "service: SSH (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # HTTP / HTTPS — web services
+        # -----------------------------------------------------------------------
+        # Uncomment if this host serves web content to mesh peers.
+        # If the host faces the public internet via a reverse proxy (e.g. Caddy,
+        # nginx) on ANOTHER node, keep this commented and access via that proxy's
+        # mesh IP instead.
+        # tcp dport { 80, 443 } accept comment "service: HTTP/HTTPS (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # DNS — recursive resolver
+        # -----------------------------------------------------------------------
+        # Uncomment if this host runs a DNS resolver (e.g. Unbound, Pi-hole,
+        # CoreDNS) for mesh peers.
+        # tcp dport 53 accept comment "service: DNS/TCP (mesh-only)"
+        # udp dport 53 accept comment "service: DNS/UDP (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Prometheus node exporter
+        # -----------------------------------------------------------------------
+        # Exposes host metrics to a Prometheus scraper running on another mesh peer.
+        # tcp dport 9100 accept comment "service: Prometheus node exporter (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Grafana
+        # -----------------------------------------------------------------------
+        # tcp dport 3000 accept comment "service: Grafana (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # PostgreSQL
+        # -----------------------------------------------------------------------
+        # tcp dport 5432 accept comment "service: PostgreSQL (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Redis
+        # -----------------------------------------------------------------------
+        # tcp dport 6379 accept comment "service: Redis (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Custom application port — template
+        # -----------------------------------------------------------------------
+        # tcp dport <PORT> accept comment "service: <NAME> — <WHY> (mesh-only)"
+        # udp dport <PORT> accept comment "service: <NAME> — <WHY> (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Admin SSH from explicit allowlist (break-glass only)
+        # -----------------------------------------------------------------------
+        # If ADMIN_ALLOWLIST is populated in 00-tables.nft, this permits SSH
+        # from those IPs even on the public interface — use only for emergency
+        # access when the VPN is down.  Leave commented unless actively needed.
+        # ip saddr @ADMIN_ALLOWLIST tcp dport 22 \
+        #     accept comment "service: SSH break-glass (admin allowlist)"
+
+        # -----------------------------------------------------------------------
+        # Catch-all: un-matched mesh traffic falls through and is logged+dropped
+        # by 70-logging.nft.  Do not add a default drop here — let logging fire.
+        # -----------------------------------------------------------------------
+    }
+}

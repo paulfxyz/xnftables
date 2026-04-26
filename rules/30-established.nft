@@ -1,0 +1,39 @@
+# =============================================================================
+# 30-established.nft — Stateful connection tracking
+# =============================================================================
+# nftables (via the kernel's conntrack module) tracks TCP sessions, UDP
+# pseudo-connections, and ICMP exchanges.  Once a connection is established
+# (e.g. a mesh peer opens a TCP connection to port 443), reply packets from
+# the server back to the peer should not have to re-match every rule.
+#
+# ct state:
+#   established — reply packets for a connection we originated or accepted
+#   related     — helper-tracked flows (FTP data, ICMP errors for TCP sessions)
+#   invalid     — malformed or out-of-state packets — always drop these
+#   new         — first packet of a new connection — falls through to other rules
+#
+# Placement: this chain runs AFTER loopback (10) but BEFORE per-service rules
+# (40) because established/related traffic should short-circuit the full chain
+# for performance.  On a busy server this alone can halve the rules evaluated
+# per packet.
+#
+# Note: conntrack only tracks connections that were ACCEPTED by this ruleset.
+# Dropped packets are never tracked, so there is no state-table amplification
+# from the internet-side default drop.
+# =============================================================================
+
+table inet filter {
+    chain input {
+        # Drop invalid packets before they reach any other rule.
+        # "Invalid" means: RST outside a session, ACK with no SYN, etc.
+        # These are common in port-scan noise and broken stacks.
+        ct state invalid \
+            log prefix "XNFT-INVALID: " level warn \
+            drop comment "conntrack: drop invalid state"
+
+        # Fast-path for already-accepted connections.
+        # This covers both inbound (mesh services) and loopback traffic.
+        ct state { established, related } \
+            accept comment "conntrack: allow established/related"
+    }
+}

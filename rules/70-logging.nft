@@ -1,0 +1,54 @@
+# =============================================================================
+# 70-logging.nft — Catch-all log + drop (MUST be the last include)
+# =============================================================================
+# Every packet that reaches this chain was not accepted by any earlier rule.
+# We log it before dropping so that:
+#   - Legitimate traffic that was accidentally blocked leaves a trace
+#   - Attack patterns (port scans, brute-force, DDoS) are visible in logs
+#   - Firewall audits have evidence of what was denied and from where
+#
+# Log prefixes use the format "XNFT-<CATEGORY>: " for easy grep/structured
+# log ingestion.  If you feed logs into a SIEM or Loki, filter on "XNFT-".
+#
+# Rate-limiting on log rules:
+#   Without rate limits, a packet flood will fill your disk with log lines.
+#   We use "limit rate 5/second burst 10 packets" — adjust to taste.
+#   Packets that exceed the rate limit are still dropped (silently) by the
+#   second drop rule below.
+#
+# Where do logs go?
+#   Kernel netfilter logs are written via the kernel log (printk).
+#   They appear in:
+#     - /var/log/kern.log  (syslog-ng / rsyslog)
+#     - journalctl -k      (systemd-journald)
+#     - dmesg
+#   To forward to a remote syslog or Loki, configure rsyslog/syslog-ng to
+#   ship kern.* facility.
+# =============================================================================
+
+table inet filter {
+    chain input {
+
+        # -------------------------------------------------------------------
+        # Catch-all: log then drop everything that wasn't explicitly accepted
+        # -------------------------------------------------------------------
+
+        # Log up to 5 packets/second to avoid disk fill under scan/flood.
+        limit rate 5/second burst 10 packets \
+            log prefix "XNFT-DROP: " level info flags all \
+            comment "catch-all: log dropped packets (rate-limited)"
+
+        # Silent drop for everything above the log rate limit.
+        drop comment "catch-all: drop (log rate-limit exceeded, silent)"
+    }
+
+    chain forward {
+        # Forward chain is drop by default (see 00-tables.nft).
+        # Log anything that tries to transit this host.
+        limit rate 5/second burst 10 packets \
+            log prefix "XNFT-FWD-DROP: " level info flags all \
+            comment "forward catch-all: log"
+
+        drop comment "forward catch-all: drop"
+    }
+}
