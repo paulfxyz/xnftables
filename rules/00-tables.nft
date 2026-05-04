@@ -1,84 +1,144 @@
 # =============================================================================
-# 00-tables.nft — Table definitions and base chain policies
+# 00-tables.nft — Table definitions, named sets, and base chain policies
 # =============================================================================
 # We use a single "inet" table which covers both IPv4 and IPv6 in one place.
 # Three base chains:
 #   input   — packets destined for THIS host
-#   forward — packets routed THROUGH this host (disable if not a router)
-#   output  — packets originating FROM this host (permissive by default)
+#   forward — packets routed THROUGH this host (drop by default)
+#   output  — packets originating FROM this host (accept by default)
 #
-# Default policies are DROP for input and forward.
-# Output is ACCEPT because we trust outbound traffic from root/services.
-# If you want zero-trust egress too, change output policy to drop and
-# add explicit output rules for each service (DNS, NTP, package managers…).
+# Default policies:
+#   input   → DROP  — nothing arrives unless explicitly permitted
+#   forward → DROP  — this host is not a transit router by default
+#   output  → ACCEPT — we trust locally-originated traffic
+#
+# If you need zero-trust egress (recommended for high-security environments),
+# change the output policy to drop and add explicit output rules for each
+# service (DNS, NTP, package managers, WireGuard, etc.).
+#
+# Sub-chains (populated by subsequent includes, in order):
+#   05-antiscan    → bogon/martian filtering, TCP scan drops, SYN flood guard
+#   10-loopback    → unconditional loopback accept
+#   20-mesh        → WireGuard wg0 trust boundary
+#   30-established → conntrack fast-path
+#   40-services    → per-service allowlist (mesh peers only)
+#   50-vpn-endpoint→ WireGuard handshake UDP port (public internet)
+#   60-icmp        → controlled ICMP/ICMPv6
+#   70-logging     → catch-all log+drop
 # =============================================================================
 
 table inet filter {
 
-    # -------------------------------------------------------------------------
-    # Named sets — edit these to match your topology
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # NAMED SETS — edit these to match your topology
+    # =========================================================================
 
     # All mesh peer addresses (WireGuard assigned IPs).
     # vpn.yourdomain.com assigns peers from 10.10.0.0/24.
-    # Add individual IPs here if you want per-peer granularity.
+    # Every node that completes the WireGuard handshake and receives a lease
+    # from your VPN server will have an IP in this range.
+    # For per-peer isolation, replace the CIDR with individual /32 entries.
     set MESH_PEERS {
         type ipv4_addr
         flags interval
-        # The full mesh subnet — every node that completed the WireGuard handshake
-        # and received an IP from your VPN server lives in this range.
         elements = { 10.10.0.0/24 }
     }
 
-    # IPv6 mesh peers (if your WireGuard server assigns v6 addresses)
+    # IPv6 mesh peers.
+    # IMPORTANT: If your WireGuard server does NOT assign IPv6 addresses to
+    # peers, leave this set empty — but read the warning below.
+    #
+    # WARNING (BUG 5A / finding 1D): If wg0 has an IPv6 address and this set
+    # is empty, ALL IPv6 mesh traffic will be silently dropped — services will
+    # be unreachable over v6 with no log message.  Either:
+    #   a) Populate this set with your mesh IPv6 prefix, OR
+    #   b) Explicitly disable IPv6 on the wg0 interface:
+    #        PostUp = sysctl -w net.ipv6.conf.wg0.disable_ipv6=1
+    # The rules in 20-mesh.nft will then guard accordingly.
     set MESH_PEERS6 {
         type ipv6_addr
         flags interval
-        # Example: fd00:10::/120  — replace with your actual prefix or leave empty
+        # Uncomment and replace with your actual v6 mesh prefix:
         # elements = { fd00:10::/120 }
     }
 
-    # Trusted admin IPs that may SSH into the host even outside the mesh.
-    # Keep this empty unless absolutely necessary — prefer mesh-only access.
+    # Break-glass emergency SSH allowlist.
+    # Only populate this for known, static egress IPs (e.g. a corporate NAT).
+    # This bypasses the mesh requirement — only use when the WireGuard VPN
+    # is completely unreachable (e.g. server reboot, WireGuard crash).
+    #
+    # !! Do NOT use RFC 5737 documentation IPs (192.0.2.x, 198.51.100.x,
+    #    203.0.113.x) here — they are unroutable and will silently fail. !!
+    #
+    # The rule that consults this set lives in 40-services.nft and is
+    # placed in the input chain BEFORE the wg0 jump, so it fires even when
+    # WireGuard is down.
     set ADMIN_ALLOWLIST {
         type ipv4_addr
         flags interval
-        # elements = { 203.0.113.42 }   # example: office egress IP
+        # elements = { 198.51.100.1 }   # REPLACE with your actual egress IP
     }
 
-    # -------------------------------------------------------------------------
-    # Base chains
-    # -------------------------------------------------------------------------
+    # Bogon / martian source addresses — should never appear on public ifaces.
+    # Packets from these ranges on non-loopback interfaces are either spoofed
+    # or misconfigured and should be dropped before any other processing.
+    # RFC references: RFC1918 (private), RFC5737 (docs), RFC3927 (link-local),
+    #                 RFC2544 (benchmarking), RFC1122 (loopback).
+    set BOGON_V4 {
+        type ipv4_addr
+        flags interval
+        elements = {
+            0.0.0.0/8,          # "this" network (RFC1122)
+            10.0.0.0/8,         # RFC1918 private
+            100.64.0.0/10,      # CGNAT shared address (RFC6598)
+            127.0.0.0/8,        # loopback — must not arrive on non-lo iface
+            169.254.0.0/16,     # link-local (RFC3927)
+            172.16.0.0/12,      # RFC1918 private
+            192.0.0.0/24,       # IETF protocol assignments (RFC6890)
+            192.0.2.0/24,       # TEST-NET-1 documentation (RFC5737)
+            192.168.0.0/16,     # RFC1918 private
+            198.18.0.0/15,      # benchmarking (RFC2544)
+            198.51.100.0/24,    # TEST-NET-2 documentation (RFC5737)
+            203.0.113.0/24,     # TEST-NET-3 documentation (RFC5737)
+            224.0.0.0/4,        # multicast
+            240.0.0.0/4,        # reserved / class E
+            255.255.255.255/32  # broadcast
+        }
+    }
+
+    # =========================================================================
+    # BASE CHAINS
+    # =========================================================================
 
     chain input {
-        # Explicit DROP policy — nothing arrives unless a rule above permits it
+        # Explicit DROP policy — nothing arrives unless a rule permits it.
         type filter hook input priority filter; policy drop;
     }
 
     chain forward {
-        # DROP by default — this host is not a transit router.
-        # If you run a WireGuard server that routes between peers, replace with:
-        #   oifname "wg0" accept  (mesh-to-mesh forwarding)
-        #   iifname "wg0" accept
+        # DROP by default.
+        # Add explicit rules here (or in a later include) if this host routes
+        # traffic between WireGuard peers (hub-and-spoke mesh).
         type filter hook forward priority filter; policy drop;
     }
 
     chain output {
-        # ACCEPT — we trust traffic originating on this host.
-        # Tighten to drop + explicit rules for paranoid egress control.
+        # ACCEPT — locally-originated traffic is trusted.
+        # For zero-trust egress, change to drop and add explicit output rules.
         type filter hook output priority filter; policy accept;
     }
 
-    # -------------------------------------------------------------------------
-    # Sub-chains called from the base chains above
-    # (populated by the subsequent include files)
-    # -------------------------------------------------------------------------
+    # =========================================================================
+    # SUB-CHAINS (populated by subsequent includes)
+    # =========================================================================
 
+    # Packets that arrived through the WireGuard tunnel
     chain mesh_input {
-        # Traffic arriving from WireGuard peers — populated by 20-mesh.nft
+        # Populated by 20-mesh.nft
     }
 
+    # Per-service allowlist — only reachable from mesh_input
     chain services {
-        # Per-service allowlist — populated by 40-services.nft
+        # Populated by 40-services.nft
     }
 }

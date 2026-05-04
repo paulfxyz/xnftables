@@ -1,43 +1,61 @@
 # =============================================================================
 # 50-vpn-endpoint.nft — WireGuard handshake port (public internet)
 # =============================================================================
-# This is the ONLY rule that allows traffic from the public internet.
+# This is the ONLY rule that accepts traffic from the public internet.
 #
-# WireGuard needs its UDP listen port reachable from the outside so that
-# peers can initiate a handshake.  Everything else — all services — remains
-# invisible to the world.
+# WireGuard needs its UDP listen port reachable from outside so that peers
+# can initiate a handshake.  Everything else — all services — remains
+# invisible and unreachable to non-mesh traffic.
 #
 # What happens on port 51820 UDP:
-#   1. A peer sends an "Initiation" datagram (148 bytes, encrypted).
+#   1. A peer sends an "Initiation" datagram (148 bytes, encrypted with
+#      the server's public key and a fresh ephemeral key pair).
 #   2. The server responds with a "Response" datagram (92 bytes).
-#   3. Both sides derive shared session keys.
-#   4. All subsequent traffic travels through the encrypted tunnel.
-#      → Those decrypted packets exit wg0 and hit the mesh rules in 20-mesh.nft.
+#   3. Both sides derive shared session keys via the Noise_IKpsk2 handshake.
+#   4. All subsequent data travels through the encrypted tunnel.
+#      → Decrypted packets exit wg0 and enter the mesh rules in 20-mesh.nft.
 #
-# A port-scanner hitting UDP/51820 will receive no response to non-WireGuard
-# datagrams (WireGuard drops anything that doesn't decrypt correctly), so the
-# port appears "open|filtered" on nmap — no information leakage.
+# Stealth property:
+#   Any UDP datagram to port 51820 that doesn't decrypt correctly is silently
+#   discarded by WireGuard.  Port scanners receive no response and classify
+#   the port as "open|filtered" — the server leaks no identifying information.
 #
-# Rate-limiting:
-#   Handshake packets are small and infrequent (one per ~3 minutes per peer
-#   under default rekey settings).  We rate-limit to 20/minute per source IP
-#   to blunt UDP flood amplification while allowing legitimate reconnects.
+# BUG FIX (3A) — global vs per-source rate limit:
+#   The original ruleset used a single shared token bucket:
+#     limit rate 20/minute
+#   This is a global counter.  A single attacker sending 20 packets/minute
+#   exhausts the entire budget, blocking ALL other peers from completing
+#   handshakes.  Effective denial-of-service against the WireGuard endpoint.
 #
-# Change the port if your WireGuard server listens on a non-default port.
+#   Fix: use a "meter" which creates an independent token bucket per source IP:
+#     meter wg_rl { ip saddr timeout 60s limit rate 5/minute }
+#   Now each peer has its own 5/minute budget.  An attacker only blocks
+#   themselves.  Legitimate peers are unaffected.
+#
+# Rate-limit rationale:
+#   WireGuard rekeys every ~3 minutes by default (REKEY_AFTER_TIME = 180s).
+#   5 handshakes/minute per source is generous for legitimate peers and still
+#   leaves headroom for reconnects after roaming or network changes.
+#
+# Change the port if your WireGuard server uses a non-default listen port.
 # Must match ListenPort in /etc/wireguard/wg0.conf.
 # =============================================================================
 
 table inet filter {
     chain input {
-        # Accept WireGuard handshake datagrams from anywhere.
-        # Rate-limited: max 20 new handshakes per minute per source IP.
-        udp dport 51820 \
-            limit rate 20/minute \
-            accept comment "vpn-endpoint: WireGuard handshake (public)"
 
-        # Log excessive handshake attempts (possible scan or DDoS probe).
+        # Per-source rate limit (BUG 3A fix).
+        # Each source IP gets its own independent token bucket: 5/minute.
+        # The meter entry expires after 60s of inactivity to bound memory use.
         udp dport 51820 \
-            log prefix "XNFT-WG-RATELIMIT: " level warn \
+            meter wg_handshake_rl { ip saddr timeout 60s limit rate 5/minute } \
+            accept comment "vpn-endpoint: WireGuard handshake per-source rate-limit"
+
+        # Log and drop: either rate exceeded or IPv6 source (no v6 meter yet).
+        # Seeing this log line from a single source IP repeatedly indicates
+        # a scan or handshake flood — worth investigating.
+        udp dport 51820 \
+            log prefix "XNFT-WG-RATELIMIT: " level info \
             drop comment "vpn-endpoint: WireGuard handshake rate-limit exceeded"
     }
 }

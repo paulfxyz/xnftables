@@ -7,8 +7,8 @@
 #             These packets come from authenticated peers.  WireGuard's
 #             cryptographic handshake guarantees the sender holds the
 #             private key that matches a pre-authorised public key on
-#             the server.  We jump to the "mesh_input" sub-chain where
-#             per-service rules live.
+#             the server.  We validate the source IP and jump to the
+#             "mesh_input" sub-chain where per-service rules live.
 #
 #   World B — everything else (eth0, the public internet):
 #             Unconditionally dropped (logged first by 70-logging.nft).
@@ -19,6 +19,12 @@
 #   it cannot have been forged by a non-peer.  Interface-level trust is
 #   therefore cryptographically sound for WireGuard.
 #
+# BUG FIX (1A) — anti-spoof check order:
+#   The spoof check MUST come BEFORE the unconditional jump to mesh_input.
+#   If the jump fires first, control never returns to the input chain for
+#   wg0 packets — the spoof rule becomes unreachable dead code.
+#   Rule order: spoof-drop → jump → (mesh_input handles everything else)
+#
 # Topology assumed:
 #   WireGuard interface : wg0
 #   VPN server FQDN     : vpn.yourdomain.com
@@ -27,37 +33,84 @@
 #   Peer range          : 10.10.0.2 – 10.10.0.254
 #
 # To use a different interface name (e.g. wg1, tailscale0, utun*):
-#   Change every "wg0" reference below.
+#   Change every "wg0" reference in this file AND in 05-antiscan.nft.
 # =============================================================================
 
 table inet filter {
     chain input {
-        # --- WireGuard tunnel: jump to per-service allowlist ---
-        # Packets decrypted out of wg0 are trusted mesh traffic.
-        # We jump (not goto) so un-matched packets fall through to the
-        # log+drop rules in chain input after mesh_input returns.
-        iifname "wg0" jump mesh_input comment "mesh: enter service allowlist"
 
-        # Explicit source-IP guard inside the tunnel (defence-in-depth).
-        # Should never fire under normal operation — if it does, a peer is
-        # sending traffic from an IP outside its assigned range, which is
-        # suspicious and should be investigated.
+        # --- Break-glass emergency SSH (ADMIN_ALLOWLIST, pre-wg0 jump) ---
+        # This MUST be here — in the input chain, before the wg0 jump.
+        # It cannot live in the services chain (which is only reached via
+        # wg0) because it needs to fire when WireGuard is DOWN.
+        # Populated only if ADMIN_ALLOWLIST has entries (00-tables.nft).
+        # Rate-limited: 10 new connections/minute per source (brute-force guard).
+        ip saddr @ADMIN_ALLOWLIST \
+            tcp dport 22 \
+            ct state new \
+            limit rate 10/minute \
+            accept comment "break-glass: emergency SSH (ADMIN_ALLOWLIST, public iface)"
+
+        # Log excessive break-glass attempts (possible brute-force on the
+        # emergency back-door).
+        ip saddr @ADMIN_ALLOWLIST \
+            tcp dport 22 \
+            ct state new \
+            log prefix "XNFT-BREAKGLASS-RATELIMIT: " level warn \
+            drop comment "break-glass: rate-limit exceeded"
+
+        # --- Anti-spoof: drop wg0 packets with non-mesh source IP FIRST ---
+        # BUG FIX (1A): This must precede the unconditional jump below.
+        # If a decrypted packet exits wg0 but its source IP is outside the
+        # mesh CIDR, something is misconfigured (wrong AllowedIPs on the
+        # WireGuard server, or a tampered peer config).
+        # This should never fire in normal operation — if it does, investigate.
         iifname "wg0" ip saddr != @MESH_PEERS \
             log prefix "XNFT-MESH-SPOOF: " level warn \
-            drop comment "mesh: drop spoofed source IP inside tunnel"
+            drop comment "mesh: spoofed source IP inside wg0 tunnel"
+
+        # IPv6 anti-spoof (if MESH_PEERS6 is populated)
+        # iifname "wg0" ip6 saddr != @MESH_PEERS6 \
+        #     log prefix "XNFT-MESH-SPOOF6: " level warn \
+        #     drop comment "mesh: spoofed IPv6 source inside wg0 tunnel"
+
+        # --- WireGuard tunnel: jump to per-service allowlist ---
+        # Only reached after the spoof check above passes.
+        # We use "jump" (not "goto") so if mesh_input returns without a
+        # verdict, the packet falls through to 70-logging.nft's catch-all.
+        iifname "wg0" jump mesh_input comment "mesh: enter service allowlist"
     }
 
     chain mesh_input {
+        # BUG FIX (1B / 2A): conntrack checks MUST run inside mesh_input.
+        # Without these, a compromised mesh peer sending invalid-state packets
+        # bypasses the conntrack gate in 30-established.nft entirely, because
+        # that chain is evaluated AFTER this jump and only for packets that
+        # return from mesh_input — but mesh_input always terminates.
+
+        # Drop invalid conntrack state from mesh peers.
+        ct state invalid \
+            log prefix "XNFT-MESH-INVALID: " level warn \
+            drop comment "mesh: conntrack invalid state"
+
+        # Fast-path for established/related connections (e.g. long-lived SSH
+        # sessions, streaming responses).  Must come after invalid-drop.
+        ct state { established, related } \
+            accept comment "mesh: conntrack established/related fast-path"
+
         # Source-address validation: ensure the decrypted packet's source IP
-        # actually belongs to a known mesh peer.
-        # This catches misconfigured AllowedIPs on the WireGuard server side.
-        ip saddr @MESH_PEERS jump services comment "mesh: known peer → services"
+        # belongs to a known mesh peer.  This catches the case where WireGuard
+        # AllowedIPs is misconfigured more broadly than the mesh CIDR.
+        ip saddr @MESH_PEERS \
+            jump services comment "mesh: known IPv4 peer → services"
 
-        # IPv6 mesh peers (uncomment if using v6 addressing in the mesh)
-        # ip6 saddr @MESH_PEERS6 jump services comment "mesh: known peer (v6) → services"
+        # IPv6 mesh peers (uncomment if MESH_PEERS6 is populated)
+        # ip6 saddr @MESH_PEERS6 \
+        #     jump services comment "mesh: known IPv6 peer → services"
 
-        # Anything else that somehow exits wg0 with a non-mesh source IP:
-        log prefix "XNFT-MESH-UNKNOWN: " level warn drop \
-            comment "mesh: unknown source, drop"
+        # Anything that exits wg0 with an unrecognised source IP.
+        # Should be caught by the spoof rule above, but belt-and-suspenders.
+        log prefix "XNFT-MESH-UNKNOWN: " level warn \
+            drop comment "mesh: unknown source IP in tunnel, drop"
     }
 }

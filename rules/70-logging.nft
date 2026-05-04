@@ -3,49 +3,58 @@
 # =============================================================================
 # Every packet that reaches this chain was not accepted by any earlier rule.
 # We log it before dropping so that:
-#   - Legitimate traffic that was accidentally blocked leaves a trace
-#   - Attack patterns (port scans, brute-force, DDoS) are visible in logs
+#   - Legitimately blocked traffic leaves a trace for debugging
+#   - Attack patterns (port scans, brute-force, DDoS probes) are visible
 #   - Firewall audits have evidence of what was denied and from where
 #
-# Log prefixes use the format "XNFT-<CATEGORY>: " for easy grep/structured
-# log ingestion.  If you feed logs into a SIEM or Loki, filter on "XNFT-".
+# Log prefix format: "XNFT-<CATEGORY>: " — filter on "XNFT-" in your SIEM.
 #
-# Rate-limiting on log rules:
-#   Without rate limits, a packet flood will fill your disk with log lines.
-#   We use "limit rate 5/second burst 10 packets" — adjust to taste.
-#   Packets that exceed the rate limit are still dropped (silently) by the
-#   second drop rule below.
+# Log rate limiting:
+#   The rate limit prevents disk fill under floods.  We use 30/second (up from
+#   the original 5/second) with burst 50 — enough to capture burst scan
+#   events while staying sane under a sustained flood.  Packets above the log
+#   rate are still dropped silently by the second rule.
 #
-# Where do logs go?
-#   Kernel netfilter logs are written via the kernel log (printk).
-#   They appear in:
-#     - /var/log/kern.log  (syslog-ng / rsyslog)
-#     - journalctl -k      (systemd-journald)
-#     - dmesg
-#   To forward to a remote syslog or Loki, configure rsyslog/syslog-ng to
-#   ship kern.* facility.
+# BUG FIX (9A) — forward chain conntrack:
+#   The original forward chain had no conntrack accept rule.  Policy drop +
+#   log+drop means ALL forwarded traffic was dropped, including established
+#   connections through a WireGuard hub router.
+#   Fixed: conntrack accept is added to forward before the log+drop catch-all.
+#
+# Where do the logs go?
+#   Kernel netfilter logs go via printk, appearing in:
+#     journalctl -k              (systemd-journald)
+#     /var/log/kern.log          (rsyslog/syslog-ng)
+#     dmesg
+#   To forward to Loki / remote syslog, configure rsyslog:
+#     :msg, contains, "XNFT-"  @your-loki-proxy:514
 # =============================================================================
 
 table inet filter {
     chain input {
 
-        # -------------------------------------------------------------------
-        # Catch-all: log then drop everything that wasn't explicitly accepted
-        # -------------------------------------------------------------------
-
-        # Log up to 5 packets/second to avoid disk fill under scan/flood.
-        limit rate 5/second burst 10 packets \
+        # Log up to 30 packets/second (burst 50) to capture scan events
+        # without filling the disk under a sustained flood.
+        limit rate 30/second burst 50 packets \
             log prefix "XNFT-DROP: " level info flags all \
             comment "catch-all: log dropped packets (rate-limited)"
 
-        # Silent drop for everything above the log rate limit.
-        drop comment "catch-all: drop (log rate-limit exceeded, silent)"
+        # Silent drop for traffic above the log rate limit.
+        drop comment "catch-all: drop"
     }
 
     chain forward {
-        # Forward chain is drop by default (see 00-tables.nft).
-        # Log anything that tries to transit this host.
-        limit rate 5/second burst 10 packets \
+        # BUG FIX (9A): must accept established/related forwarded connections
+        # before the drop, otherwise WireGuard hub routing silently breaks.
+        ct state invalid \
+            log prefix "XNFT-FWD-INVALID: " level info \
+            drop comment "forward: drop invalid conntrack state"
+
+        ct state { established, related } \
+            accept comment "forward: established/related (hub routing)"
+
+        # Log forwarding attempts that don't match any established session.
+        limit rate 10/second burst 20 packets \
             log prefix "XNFT-FWD-DROP: " level info flags all \
             comment "forward catch-all: log"
 

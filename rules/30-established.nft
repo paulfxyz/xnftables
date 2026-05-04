@@ -1,39 +1,61 @@
 # =============================================================================
-# 30-established.nft — Stateful connection tracking
+# 30-established.nft — Stateful connection tracking (public-interface fast-path)
 # =============================================================================
 # nftables (via the kernel's conntrack module) tracks TCP sessions, UDP
 # pseudo-connections, and ICMP exchanges.  Once a connection is established
-# (e.g. a mesh peer opens a TCP connection to port 443), reply packets from
-# the server back to the peer should not have to re-match every rule.
+# and accepted, reply packets don't need to re-match every rule.
 #
-# ct state:
-#   established — reply packets for a connection we originated or accepted
+# ct state values:
+#   new         — first packet of a new connection (falls through to later rules)
+#   established — reply packets for a connection already accepted
 #   related     — helper-tracked flows (FTP data, ICMP errors for TCP sessions)
-#   invalid     — malformed or out-of-state packets — always drop these
-#   new         — first packet of a new connection — falls through to other rules
+#   invalid     — malformed or out-of-state (RST with no session, ACK no SYN…)
+#   untracked   — conntrack explicitly disabled for this packet (via "raw" table)
 #
-# Placement: this chain runs AFTER loopback (10) but BEFORE per-service rules
-# (40) because established/related traffic should short-circuit the full chain
-# for performance.  On a busy server this alone can halve the rules evaluated
-# per packet.
+# NOTE on placement relative to 20-mesh.nft:
+#   Packets arriving via wg0 are diverted into mesh_input (20-mesh.nft) and
+#   never return to this chain.  The conntrack checks below therefore apply
+#   to NON-mesh traffic (public interface) only.
+#   Mesh traffic has its own conntrack checks inside mesh_input (20-mesh.nft)
+#   as a result of BUG fix 1B/2A.
 #
-# Note: conntrack only tracks connections that were ACCEPTED by this ruleset.
-# Dropped packets are never tracked, so there is no state-table amplification
-# from the internet-side default drop.
+# Conntrack table exhaustion (GAP 2C):
+#   Under a SYN flood or UDP flood, the conntrack table can fill, causing
+#   ct state established to stop matching — all active connections drop.
+#   Mitigations:
+#     a) SYN flood guard in 05-antiscan.nft (per-source rate limit)
+#     b) Tune the conntrack table size in /etc/sysctl.d/:
+#          net.netfilter.nf_conntrack_max = 262144
+#          net.netfilter.nf_conntrack_tcp_timeout_established = 86400
+#          net.netfilter.nf_conntrack_udp_timeout = 30
+#     c) For extremely high traffic, use "notrack" in the raw table to
+#        bypass conntrack entirely for known-safe flows.
 # =============================================================================
 
 table inet filter {
     chain input {
-        # Drop invalid packets before they reach any other rule.
-        # "Invalid" means: RST outside a session, ACK with no SYN, etc.
-        # These are common in port-scan noise and broken stacks.
+        # Drop invalid packets before they can match any rule.
+        # "Invalid" means: RST outside a session, ACK with no SYN, overlapping
+        # reassembly, etc.  These are common in port-scan noise and broken stacks.
+        # Must come BEFORE the established/related accept below.
         ct state invalid \
-            log prefix "XNFT-INVALID: " level warn \
-            drop comment "conntrack: drop invalid state"
+            log prefix "XNFT-INVALID: " level info \
+            drop comment "conntrack: drop invalid state (public iface)"
 
         # Fast-path for already-accepted connections.
-        # This covers both inbound (mesh services) and loopback traffic.
+        # This prevents every reply packet from traversing the full chain.
+        # On a moderately busy server this rule handles the vast majority of
+        # inbound packets.
         ct state { established, related } \
-            accept comment "conntrack: allow established/related"
+            accept comment "conntrack: established/related fast-path (public iface)"
+    }
+
+    chain output {
+        # Drop invalid state on output too.
+        # Without this, a compromised process could send RST/ACK-flood
+        # packets that aren't part of any real session.
+        ct state invalid \
+            log prefix "XNFT-OUT-INVALID: " level info \
+            drop comment "conntrack: drop invalid state on output"
     }
 }

@@ -4,6 +4,7 @@
 [![nftables](https://img.shields.io/badge/nftables-%E2%89%A50.9.3-orange?logo=linux&logoColor=white)](https://wiki.nftables.org/)
 [![WireGuard](https://img.shields.io/badge/WireGuard-mesh--or--nothing-88171A?logo=wireguard&logoColor=white)](https://www.wireguard.com/)
 [![Kernel](https://img.shields.io/badge/Linux%20kernel-%E2%89%A55.6-informational?logo=linux&logoColor=white)](https://www.kernel.org/)
+[![CI](https://img.shields.io/github/actions/workflow/status/paulfxyz/xnftables/validate.yml?label=nft%20syntax)](https://github.com/paulfxyz/xnftables/actions)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/paulfxyz/xnftables/pulls)
 [![Deny All](https://img.shields.io/badge/default%20policy-DROP-critical)](https://github.com/paulfxyz/xnftables)
 
@@ -11,7 +12,7 @@
 
 > **If you are not inside the mesh, you see nothing.**
 >
-> Deny-all defaults. Every exception is explicit, documented and auditable.  
+> Deny-all defaults. Every exception is explicit, documented and auditable.
 > Least privilege at the network layer.
 
 ---
@@ -24,14 +25,18 @@
 - [Packet flow](#packet-flow)
 - [Quick start](#quick-start)
 - [WireGuard server setup](#wireguard-server-setup-vpnyourdomaincom)
+- [Reloading safely](#reloading-safely)
 - [Adding and removing services](#adding-a-service)
 - [Reading the logs](#reading-the-logs)
 - [Auditing the ruleset](#auditing-the-ruleset)
 - [Security model](#security-model)
+- [Known bugs fixed in v2](#known-bugs-fixed-in-v2)
 - [nftables primer](#nftables-primer)
 - [Why nftables over iptables](#why-nftables-over-iptables)
 - [Why WireGuard over OpenVPN / IPsec](#why-wireguard-over-openvpn--ipsec)
 - [Threat modelling](#threat-modelling)
+- [Docker / Podman / LXC interaction](#docker--podman--lxc-interaction)
+- [Tailscale / Netbird / Headscale adaptation](#tailscale--netbird--headscale-adaptation)
 - [Advanced patterns](#advanced-patterns)
 - [Hardening checklist](#hardening-checklist)
 - [Tested on](#tested-on)
@@ -41,11 +46,11 @@
 
 ## The idea
 
-Most firewall configs are written backwards: start open, punch holes as problems appear, never clean them up.  After a year you have a ruleset nobody fully understands, with ports open "just in case" and rules that reference services decommissioned in 2021.
+Most firewall configs are written backwards: start open, punch holes as problems appear, never clean them up. After a year you have a ruleset nobody fully understands, with ports open "just in case" and rules that reference services decommissioned in 2021.
 
-`xnftables` inverts that.  The only way traffic reaches this host is through a **WireGuard mesh**.  The public internet sees exactly one thing: a UDP port for WireGuard handshakes.  Everything else — SSH, HTTP, databases, monitoring — is invisible and unreachable unless you are an authenticated mesh peer.
+`xnftables` inverts that. The only way traffic reaches this host is through a **WireGuard mesh**. The public internet sees exactly one thing: a UDP port for WireGuard handshakes. Everything else — SSH, HTTP, databases, monitoring — is invisible and unreachable unless you are an authenticated mesh peer.
 
-This is a template policy, not a turnkey product.  It is meant to be read, understood, and adapted.  Every rule has a comment explaining *why* it exists, not just what it does.
+This is a template policy, not a turnkey product. It is meant to be read, understood, and adapted. Every rule has a comment explaining *why* it exists, not just what it does.
 
 ---
 
@@ -59,13 +64,13 @@ chain input {
 }
 ```
 
-The kernel drops any packet that doesn't match a rule.  There is no implicit "allow established", no loopback accept, nothing.  Every `accept` is deliberate.
+The kernel drops any packet that doesn't match a rule. There is no implicit "allow established", no loopback accept, nothing. Every `accept` is deliberate.
 
-This feels uncomfortable the first time.  It shouldn't.  The alternative — "allow everything and block the bad stuff" — is an infinite game you will always lose.  Attackers only need to find one gap.  A deny-all policy means you define the entire surface.
+This feels uncomfortable the first time. It shouldn't. The alternative — "allow everything and block the bad stuff" — is an infinite game you will always lose. Attackers only need to find one gap. A deny-all policy means you define the entire surface.
 
 ### Mesh or nothing
 
-[WireGuard](https://www.wireguard.com/) is a modern VPN protocol built into the Linux kernel since 5.6.  Its key properties for this use case:
+[WireGuard](https://www.wireguard.com/) is a modern VPN protocol built into the Linux kernel since 5.6. Its key properties for this use case:
 
 | Property | Implication |
 |---|---|
@@ -74,32 +79,38 @@ This feels uncomfortable the first time.  It shouldn't.  The alternative — "al
 | In-kernel performance | No userspace daemon overhead; same throughput as unencrypted kernel networking |
 | Minimal attack surface | ~4,000 lines of code vs hundreds of thousands for OpenVPN/IPsec |
 
-We trust the `wg0` interface at the network layer.  A packet that arrived on `wg0` has already been cryptographically authenticated.  We then perform a second check — source IP must be in the mesh CIDR — as defence-in-depth against misconfigured `AllowedIPs`.
+We trust the `wg0` interface at the network layer. A packet that arrived on `wg0` has already been cryptographically authenticated. We then perform a second check — source IP must be in the mesh CIDR — as defence-in-depth against misconfigured `AllowedIPs`.
 
 ### Explicit, named, auditable
 
-Every rule carries a `comment` field.  `nft list ruleset` shows them.  Rules with no comment are rejected in PR.
+Every rule carries a `comment` field. `nft list ruleset` shows them. Rules without comments are rejected in PR review.
 
-Changes are committed to git with a message explaining *why* a service was added or removed.  The git log is your audit trail.
+Changes are committed to git with a message explaining *why* a service was added or removed. The git log is your audit trail. A CI workflow (`.github/workflows/validate.yml`) validates syntax on every push.
 
 ---
 
 ## File structure
 
 ```
-nftables.conf              ← entry point (flush + include chain)
+nftables.conf                    ← entry point (scoped flush + includes)
 rules/
-  00-tables.nft            ← table, chain definitions, named sets, default DROP
-  10-loopback.nft          ← loopback unconditional accept
-  20-mesh.nft              ← WireGuard interface trust + source validation
-  30-established.nft       ← conntrack: established/related accept, invalid drop
-  40-services.nft          ← per-service allowlist (mesh peers only)
-  50-vpn-endpoint.nft      ← WireGuard UDP port (only public-internet rule)
-  60-icmp.nft              ← controlled ICMP/ICMPv6
-  70-logging.nft           ← catch-all log+drop (must stay last)
+  00-tables.nft                  ← table, chains, named sets (MESH_PEERS, BOGON_V4…)
+  05-antiscan.nft                ← bogons, TCP flag abuse, SYN flood, fragments
+  10-loopback.nft                ← loopback unconditional accept
+  20-mesh.nft                    ← WireGuard trust boundary + break-glass
+  30-established.nft             ← conntrack fast-path (public iface)
+  40-services.nft                ← per-service allowlist (mesh peers only)
+  50-vpn-endpoint.nft            ← WireGuard UDP port (per-source rate-limited)
+  60-icmp.nft                    ← controlled ICMP/ICMPv6
+  70-logging.nft                 ← catch-all log+drop (must stay last)
+scripts/
+  reload.sh                      ← safe reload with dry-run + auto-rollback
+  check.sh                       ← syntax validator (pre-commit / CI)
+.github/
+  workflows/validate.yml         ← GitHub Actions CI pipeline
 ```
 
-The include order matters.  Loopback and conntrack come before service rules so that established-connection packets short-circuit the full evaluation.  Logging always comes last so it only fires on packets that were not accepted anywhere.
+The include order matters. `05-antiscan` drops impossible packets first. Loopback and conntrack come before service rules. Logging is always last.
 
 ---
 
@@ -109,37 +120,55 @@ The include order matters.  Loopback and conntrack come before service rules so 
 Incoming packet
       │
       ▼
-[iifname == "lo"] ──────────────────────────────────────────► ACCEPT  (10-loopback)
+[05-antiscan]
+  bogon source?          ──────────────────────────────► LOG + DROP
+  TCP NULL/XMAS/SYN+FIN? ──────────────────────────────► LOG + DROP
+  SYN flood per-source?  ──────────────────────────────► LOG + DROP
+  IP fragment (public)?  ──────────────────────────────► LOG + DROP
       │
       ▼
-[ct state invalid] ─────────────────────────────────────────► LOG + DROP  (30-established)
+[10-loopback]
+  iifname == "lo"        ──────────────────────────────► ACCEPT
       │
       ▼
-[ct state established/related] ─────────────────────────────► ACCEPT  (30-established)
+[20-mesh]
+  ADMIN_ALLOWLIST + tcp/22 (break-glass, pre-wg0) ─────► ACCEPT (rate-limited)
+  wg0 + saddr ∉ MESH_PEERS ────────────────────────────► LOG + DROP (spoof)
+  wg0                    ──────────────────────────────► jump mesh_input
+                                  │
+                           mesh_input:
+                           ct invalid ───────────────────► LOG + DROP
+                           ct established ──────────────► ACCEPT (fast-path)
+                           saddr ∈ MESH_PEERS ──────────► jump services
+                                      │
+                               services:
+                               tcp/22  ─────────────────► ACCEPT (SSH, rate-limited)
+                               tcp/443 ─────────────────► ACCEPT (if enabled)
+                               …other explicit services…
+                               no match ────────────────► fall-through
       │
       ▼
-[iifname == "wg0"] ──► [ip saddr ∈ @MESH_PEERS] ──► jump services
-      │                          │                          │
-      │                    else  └──────────────────────────► LOG + DROP (spoof)
-      │                                                       (20-mesh)
-      │
-      │         ┌─ tcp dport 22   ──► ACCEPT  (SSH)
-      │         ├─ tcp dport 443  ──► ACCEPT  (HTTPS, if enabled)
-      └── wg0 ──┤─ tcp dport 9100 ──► ACCEPT  (Prometheus, if enabled)
-                ├─ …any other explicit service…
-                └─ no match      ──► fall-through → LOG + DROP  (70-logging)
+[30-established]  (public iface only — mesh handled above)
+  ct invalid       ────────────────────────────────────► LOG + DROP
+  ct established   ────────────────────────────────────► ACCEPT
       │
       ▼
-[udp dport 51820, rate ≤ 20/min] ──────────────────────────► ACCEPT  (50-vpn-endpoint)
-[udp dport 51820, rate > 20/min] ──────────────────────────► LOG + DROP
+[50-vpn-endpoint]
+  udp/51820, per-source rate OK  ──────────────────────► ACCEPT (WireGuard)
+  udp/51820, rate exceeded       ──────────────────────► LOG + DROP
       │
       ▼
-[ICMP essential types] ─────────────────────────────────────► ACCEPT  (60-icmp)
-[ICMP echo-request, saddr ∈ @MESH_PEERS] ──────────────────► ACCEPT
-[ICMP other] ───────────────────────────────────────────────► LOG + DROP
+[60-icmp]
+  echo-request from MESH_PEERS   ──────────────────────► ACCEPT (rate-limited)
+  echo-request from internet     ──────────────────────► DROP (stealth)
+  PMTUD/traceroute types         ──────────────────────► ACCEPT (rate-limited)
+  NDP (no nd-redirect)           ──────────────────────► ACCEPT (rate-limited)
+  nd-redirect                    ──────────────────────► LOG + DROP (MITM vector)
+  everything else                ──────────────────────► LOG + DROP
       │
       ▼
-[everything else] ──────────────────────────────────────────► LOG + DROP  (70-logging)
+[70-logging]  catch-all
+  log (rate-limited 30/s)        ──────────────────────► LOG + DROP
 ```
 
 ---
@@ -172,39 +201,30 @@ set MESH_PEERS {
 }
 ```
 
-Open `rules/20-mesh.nft` and verify the WireGuard interface name:
-
-```nft
-iifname "wg0" jump mesh_input   # ← your wg interface (wg0, wg1, tailscale0…)
-```
-
-Open `rules/50-vpn-endpoint.nft` and verify the listen port:
-
-```nft
-udp dport 51820   # ← must match ListenPort in /etc/wireguard/wg0.conf
-```
+Open `rules/20-mesh.nft` and verify the WireGuard interface name (`wg0`). Open `rules/50-vpn-endpoint.nft` and verify the listen port matches `ListenPort` in your `wg0.conf`.
 
 ### 3. Enable services
 
-Open `rules/40-services.nft` and uncomment the services this host exposes to mesh peers.  Example — a host running an HTTPS app and Prometheus exporter:
+Open `rules/40-services.nft` and uncomment what this host exposes to mesh peers:
 
 ```nft
 tcp dport 443  accept comment "service: HTTPS app (mesh-only)"
 tcp dport 9100 accept comment "service: Prometheus node exporter (mesh-only)"
 ```
 
-### 4. Install
+### 4. Install and reload
 
 ```bash
-# Dry-run first — validates syntax without loading
+# Dry-run first
 sudo nft -c -f nftables.conf
 
-# Install rules/ to system path
+# Install
 sudo cp -r rules/ /etc/nftables/
 sudo cp nftables.conf /etc/nftables.conf
+chmod +x scripts/reload.sh scripts/check.sh
 
-# Load
-sudo nft -f /etc/nftables/nftables.conf
+# Safe reload (validates, saves rollback, applies)
+sudo ./scripts/reload.sh
 
 # Verify
 sudo nft list ruleset
@@ -213,18 +233,22 @@ sudo nft list ruleset
 ### 5. Persist across reboots
 
 ```bash
-# systemd
 sudo systemctl enable nftables
 sudo systemctl start nftables
 ```
 
-On Debian/Ubuntu, `nftables.service` reads `/etc/nftables.conf` on start.
+### 6. Install pre-commit hook
+
+```bash
+cp scripts/check.sh .git/hooks/pre-commit
+chmod +x .git/hooks/pre-commit
+```
+
+From now on, every `git commit` that touches `.nft` files will fail if syntax is invalid.
 
 ---
 
 ## WireGuard server setup (vpn.yourdomain.com)
-
-This section describes a minimal server configuration compatible with the mesh policy above.  Adapt IP ranges and interface names to your environment.
 
 ### /etc/wireguard/wg0.conf (server)
 
@@ -234,23 +258,22 @@ Address    = 10.10.0.1/24
 ListenPort = 51820
 PrivateKey = <SERVER_PRIVATE_KEY>
 
-# Enable routing between mesh peers (optional — needed only if peers should
-# reach each other, not just the server)
+# Routing between mesh peers (hub-and-spoke — optional)
 PostUp   = iptables -A FORWARD -i wg0 -j ACCEPT; iptables -t nat -A POSTROUTING -o eth0 -j MASQUERADE
 PostDown = iptables -D FORWARD -i wg0 -j ACCEPT; iptables -t nat -D POSTROUTING -o eth0 -j MASQUERADE
 
-# --- Peer: workstation-alice ---
 [Peer]
+# workstation-alice
 PublicKey  = <ALICE_PUBLIC_KEY>
 AllowedIPs = 10.10.0.2/32
 
-# --- Peer: server-prod-01 ---
 [Peer]
+# server-prod-01
 PublicKey  = <PROD01_PUBLIC_KEY>
 AllowedIPs = 10.10.0.3/32
 ```
 
-**AllowedIPs on the server** defines which source IPs are permitted per peer.  This is WireGuard's first layer of isolation — a peer assigned `10.10.0.2/32` cannot send traffic claiming to be `10.10.0.5`.  Our nftables `@MESH_PEERS` set is a second layer.
+**AllowedIPs per peer** is WireGuard's first isolation layer — a peer assigned `10.10.0.2/32` cannot send traffic claiming to be `10.10.0.5`. Our `@MESH_PEERS` set is the second layer.
 
 ### /etc/wireguard/wg0.conf (client/peer)
 
@@ -258,44 +281,78 @@ AllowedIPs = 10.10.0.3/32
 [Interface]
 Address    = 10.10.0.2/32
 PrivateKey = <ALICE_PRIVATE_KEY>
-DNS        = 10.10.0.1          # optional: use a resolver on the VPN server
+DNS        = 10.10.0.1
 
 [Peer]
 PublicKey           = <SERVER_PUBLIC_KEY>
 Endpoint            = vpn.yourdomain.com:51820
-AllowedIPs          = 10.10.0.0/24   # route only mesh traffic through the tunnel
-PersistentKeepalive = 25             # keep NAT mappings alive
+AllowedIPs          = 10.10.0.0/24   # route only mesh traffic through tunnel
+PersistentKeepalive = 25
 ```
 
 ### Key generation
 
 ```bash
-# Generate server key pair
+# Server key pair
 wg genkey | tee server.key | wg pubkey > server.pub
+chmod 600 server.key
 
-# Generate peer key pair
+# Peer key pair
 wg genkey | tee peer.key | wg pubkey > peer.pub
+chmod 600 peer.key
 
-# Optional: pre-shared key for post-quantum resistance
+# Optional: pre-shared key (post-quantum resistance layer)
 wg genpsk > peer.psk
+chmod 600 peer.psk
 ```
 
-Store private keys with `chmod 600`.  Never commit them.  Use a secrets manager (Vault, age-encrypted secrets, etc.) for automation.
+Never commit private keys. Use a secrets manager (HashiCorp Vault, age-encrypted secrets, etc.).
 
-### Bringing the interface up/down
+### Peer revocation (without restarting WireGuard)
 
 ```bash
-# Start
-sudo wg-quick up wg0
+# Remove the [Peer] block from wg0.conf, then:
+sudo wg syncconf wg0 <(wg-quick strip wg0)
 
-# Stop
-sudo wg-quick down wg0
-
-# Status
+# Verify the peer is gone
 sudo wg show
+```
 
-# Live peer stats (handshake times, transfer bytes)
-watch -n 1 sudo wg show
+---
+
+## Reloading safely
+
+**Never** run `sudo nft -f /etc/nftables/nftables.conf` directly without validating first. A syntax error in any include file after the table flush leaves the machine with **no firewall rules** — completely open.
+
+### Safe reload script
+
+```bash
+sudo ./scripts/reload.sh
+```
+
+What it does:
+1. Runs `nft -c` (dry-run — validates without touching state)
+2. Saves a rollback dump of the current live ruleset
+3. Applies the new config
+4. If `nft -f` fails, auto-reverts to the saved dump
+
+### Remote-safe testing (auto-rollback)
+
+When testing new rules on a remote server where a lockout would be catastrophic:
+
+```bash
+# Apply rules, but auto-revert after 60 seconds unless you cancel
+sudo ./scripts/reload.sh --confirm-timeout 60
+# If the new rules work: kill the background revert job (script prints the PID)
+# If you get locked out: wait 60 seconds, rules revert automatically
+```
+
+### Validate only (no apply)
+
+```bash
+sudo ./scripts/reload.sh --dry-run
+# or directly:
+sudo nft -c -f /etc/nftables/nftables.conf
 ```
 
 ---
@@ -303,43 +360,49 @@ watch -n 1 sudo wg show
 ## Adding a service
 
 1. Uncomment or add a rule in `rules/40-services.nft`
-2. Use the template:
-   ```nft
-   tcp dport <PORT> accept comment "service: <NAME> — <PURPOSE> (mesh-only)"
-   ```
-3. Reload: `sudo nft -f /etc/nftables/nftables.conf`
-4. Test connectivity from a mesh peer: `nc -zv 10.10.0.1 <PORT>`
-5. Verify the rule appears: `sudo nft list chain inet filter services`
-6. Commit: `feat: open TCP/<PORT> for <NAME> on <hostname>`
-
-Never add a rule without a `comment`.  The comment is the documentation.
+2. Template: `tcp dport <PORT> accept comment "service: <NAME> — <PURPOSE> (mesh-only)"`
+3. Dry-run: `sudo ./scripts/reload.sh --dry-run`
+4. Reload: `sudo ./scripts/reload.sh`
+5. Test from a mesh peer: `nc -zv 10.10.0.1 <PORT>`
+6. Commit: `git commit -m "feat: open TCP/<PORT> for <NAME> on <host>"`
 
 ## Removing a service
 
-1. Comment out the rule in `rules/40-services.nft`
-2. Reload
-3. Test that the port is no longer reachable from a mesh peer
-4. Commit: `feat: close TCP/<PORT> <NAME> — <reason>`
-
-Prefer commenting out over deleting — the git diff becomes the audit log.
+Comment out the rule (don't delete it), reload, test, commit with a reason. The git diff is the audit trail.
 
 ---
 
 ## Reading the logs
 
-Log lines are prefixed with `XNFT-<CATEGORY>:` for easy filtering.
+All log lines are prefixed `XNFT-<CATEGORY>:` for easy filtering.
 
 | Prefix | Meaning |
 |---|---|
-| `XNFT-DROP` | Catch-all drop — packet not matched by any allow rule |
-| `XNFT-INVALID` | Conntrack invalid state (broken TCP, out-of-state RST…) |
+| `XNFT-DROP` | Catch-all drop — not matched by any allow rule |
+| `XNFT-INVALID` | Conntrack invalid state (public iface) |
+| `XNFT-MESH-INVALID` | Conntrack invalid state inside the mesh tunnel |
 | `XNFT-MESH-SPOOF` | Packet inside `wg0` with source IP outside `@MESH_PEERS` |
-| `XNFT-MESH-UNKNOWN` | Packet inside `wg0` from an unrecognised peer |
-| `XNFT-WG-RATELIMIT` | WireGuard handshake rate limit exceeded |
+| `XNFT-MESH-UNKNOWN` | Packet inside `wg0` from unrecognised source |
+| `XNFT-WG-RATELIMIT` | WireGuard handshake per-source rate limit exceeded |
+| `XNFT-BREAKGLASS-RATELIMIT` | Break-glass SSH rate limit exceeded (brute-force attempt) |
+| `XNFT-BOGON` | Bogon/martian source IP on public interface |
+| `XNFT-LOOPBACK-SPOOF` | 127.x / ::1 source on non-loopback interface |
+| `XNFT-TCPFL-NULL` | TCP NULL scan (no flags) |
+| `XNFT-TCPFL-XMAS` | TCP XMAS scan (FIN+PSH+URG) |
+| `XNFT-TCPFL-SYNFIN` | TCP SYN+FIN (impossible combination) |
+| `XNFT-TCPFL-SYNRST` | TCP SYN+RST (impossible combination) |
+| `XNFT-TCPFL-FIN` | TCP FIN scan (bare FIN on new connection) |
+| `XNFT-SYNFLOOD` | SYN flood per-source rate limit exceeded |
+| `XNFT-FRAGMENT` | Fragmented IPv4 packet on public interface |
+| `XNFT-SSH-RATELIMIT` | SSH new-connection rate limit exceeded (mesh peer) |
 | `XNFT-ICMP4-DROP` | Unmatched IPv4 ICMP |
+| `XNFT-ICMP4-EXCESS` | ICMP essential types rate limit exceeded |
 | `XNFT-ICMP6-DROP` | Unmatched ICMPv6 |
-| `XNFT-FWD-DROP` | Packet dropped in the forward chain |
-| `XNFT-EGRESS-DROP` | Packet dropped on output (if egress control is enabled) |
+| `XNFT-ICMP6-REDIRECT` | ICMPv6 nd-redirect dropped (MITM vector) |
+| `XNFT-ICMP6-EXCESS` | ICMPv6 PMTUD rate limit exceeded |
+| `XNFT-NDP-EXCESS` | NDP rate limit exceeded |
+| `XNFT-FWD-DROP` | Forward chain drop |
+| `XNFT-FWD-INVALID` | Forward chain invalid conntrack state |
 
 ### Live monitoring
 
@@ -347,38 +410,26 @@ Log lines are prefixed with `XNFT-<CATEGORY>:` for easy filtering.
 # All xnftables events
 journalctl -k -f | grep "XNFT-"
 
-# Only unexpected drops (ignore WireGuard noise)
-journalctl -k -f | grep "XNFT-DROP"
+# Scan activity only
+journalctl -k -f | grep -E "XNFT-(TCPFL|BOGON|SYNFLOOD|FRAGMENT)"
 
-# Top source IPs hitting the catch-all (last 1000 lines)
+# Top source IPs in the catch-all (last 1000 lines)
 journalctl -k -n 1000 | grep "XNFT-DROP" \
-  | grep -oP 'SRC=\S+' | sort | uniq -c | sort -rn | head
+  | grep -oP 'SRC=\S+' | sort | uniq -c | sort -rn | head -20
 
-# Decode a full log line
-# Example output:
-# Apr 26 19:01:44 host kernel: XNFT-DROP: IN=eth0 OUT= MAC=... SRC=185.220.101.5
-#   DST=10.0.0.1 LEN=44 TOS=0x00 PREC=0x00 TTL=235 ID=54321 PROTO=TCP
-#   SPT=54321 DPT=22 WINDOW=1024 RES=0x00 SYN URGP=0
-#
-# SRC   = source IP (the scanner/attacker)
-# DST   = your server IP
-# DPT   = destination port they tried to reach
-# PROTO = TCP/UDP/ICMP
+# Decode a log line
+# Apr 26 19:01:44 host kernel: XNFT-TCPFL-XMAS: IN=eth0 SRC=185.220.101.5
+#   DST=10.0.0.1 PROTO=TCP SPT=54321 DPT=443 FIN PSH URG
 ```
 
-### Structured logging with rsyslog
-
-To ship `XNFT-*` events to a remote SIEM or Loki instance, add to `/etc/rsyslog.conf`:
+### SIEM / Loki forwarding
 
 ```
-# Forward all kernel netfilter logs matching XNFT- to a remote host
-:msg, contains, "XNFT-" @your-siem-host:514
-```
+# /etc/rsyslog.conf — forward all XNFT events to remote syslog
+:msg, contains, "XNFT-"  @your-siem-host:514
 
-Or to a local file for analysis:
-
-```
-:msg, contains, "XNFT-" /var/log/xnftables.log
+# Or write to a dedicated file
+:msg, contains, "XNFT-"  /var/log/xnftables.log
 & stop
 ```
 
@@ -386,65 +437,28 @@ Or to a local file for analysis:
 
 ## Auditing the ruleset
 
-### Dump the live ruleset
-
 ```bash
+# Dump the full live ruleset
 sudo nft list ruleset
-```
 
-### List only named sets (peer CIDRs)
-
-```bash
-sudo nft list sets
-```
-
-### List a specific chain
-
-```bash
+# List only the services chain
 sudo nft list chain inet filter services
-sudo nft list chain inet filter mesh_input
-```
 
-### Validate config before applying
+# List named sets (peer CIDRs)
+sudo nft list sets
 
-```bash
-sudo nft -c -f /etc/nftables/nftables.conf
-```
-
-### Add rule counters for live hit tracking
-
-```nft
-tcp dport 22 counter accept comment "service: SSH (mesh-only)"
-```
-
-Then watch them:
-
-```bash
+# Live rule hit counters (add 'counter' to any rule first)
 watch -n 1 'sudo nft list chain inet filter services'
-```
 
-### Trace a specific packet (debug mode)
+# Validate without applying
+sudo nft -c -f /etc/nftables/nftables.conf
 
-nftables has a built-in packet tracer.  Use it to debug why a packet is or isn't matching:
-
-```bash
-# Enable tracing for all input packets (temporary)
+# Trace a specific packet through the ruleset
 sudo nft 'add rule inet filter input meta nftrace set 1'
-
-# Monitor the trace output
 sudo nft monitor trace
-
-# Remove the trace rule (get the handle first)
+# remove the trace rule after:
 sudo nft list chain inet filter input -a
 sudo nft delete rule inet filter input handle <HANDLE>
-```
-
-Sample trace output:
-
-```
-trace id 1234abcd inet filter input packet: iif "eth0" ip saddr 203.0.113.5 …
-trace id 1234abcd inet filter input rule iifname "lo" accept (verdict accept)
-trace id 1234abcd inet filter input verdict drop
 ```
 
 ---
@@ -456,40 +470,128 @@ trace id 1234abcd inet filter input verdict drop
 | Threat | Mitigation |
 |---|---|
 | Port scanning from the internet | Default drop; only UDP/51820 responds, and only to valid WireGuard datagrams |
-| Brute-force SSH | SSH is invisible to non-mesh traffic |
 | Service enumeration | No ports respond to unauthenticated connections |
-| Spoofed source IPs inside the tunnel | WireGuard `AllowedIPs` + nftables `@MESH_PEERS` dual check |
-| WireGuard handshake flood | Rate-limited to 20/min per source IP |
-| Invalid/broken TCP state | `ct state invalid` drop before any rule evaluation |
-| ICMP-based reconnaissance | Only essential ICMP types allowed; ping restricted to mesh peers |
-| Accidental rule sprawl | Every rule is explicit, commented, and version-controlled |
+| Brute-force SSH | SSH is invisible to non-mesh traffic; rate-limited within mesh |
+| Spoofed source IPs inside tunnel | WireGuard `AllowedIPs` + nftables `@MESH_PEERS` dual check |
+| WireGuard handshake flood (DoS) | Per-source meter — attacker can only exhaust their own budget |
+| TCP scan techniques (NULL/XMAS/FIN) | Detected and dropped in `05-antiscan.nft` with dedicated log prefixes |
+| SYN flood | Per-source rate limit (+ kernel SYN cookies recommended) |
+| Bogon / martian source addresses | `BOGON_V4` set blocks RFC1918/documentation/reserved ranges on public iface |
+| IP fragmentation attacks | Fragments dropped on public interface |
+| Invalid conntrack state (mesh) | Checked inside `mesh_input` before service rules — bugs 1B/2A fixed |
+| PMTUD blackhole injection | ICMP dest-unreachable rate-limited to 10/s |
+| ICMPv6 MITM via nd-redirect | `nd-redirect` explicitly dropped — bug 4B fixed |
+| NDP neighbour-cache exhaustion | NDP rate-limited at 50/s |
+| Unsafe reload (open window) | Scoped table flush + `reload.sh` dry-run guard |
+| Docker NAT table destruction | Scoped flush instead of `flush ruleset` — bug 10A fixed |
 
 ### What this policy does NOT protect against
 
 | Threat | Notes |
 |---|---|
-| Compromised mesh peer | A peer with a valid key can reach all open services. Use per-peer rules for finer isolation. |
-| Vulnerabilities in exposed services | nftables controls access, not application security. Patch your services. |
-| Egress data exfiltration | Output policy is ACCEPT by default. Add egress rules if needed. |
-| Layer 7 attacks | This is L3/L4 only. Deploy a WAF for HTTP-level protection. |
+| Compromised mesh peer | A valid key can reach all open services. Use per-peer rules for isolation. |
+| Application-layer vulnerabilities | nftables is L3/L4. Deploy a WAF for HTTP-level threats. |
+| Egress data exfiltration | Output policy is `accept` by default. Add egress rules if needed. |
 | Physical / hypervisor compromise | Out of scope for a network firewall. |
+
+---
+
+## Known bugs fixed in v2
+
+This section documents every bug found in v1 and how it was fixed. Transparency about past mistakes is part of what makes a ruleset auditable.
+
+### BUG 1A — Anti-spoof rule was dead code
+
+**v1 code:**
+```nft
+chain input {
+    iifname "wg0" jump mesh_input         # ← all wg0 packets diverted here
+    iifname "wg0" ip saddr != @MESH_PEERS # ← DEAD: never reached
+        log prefix "XNFT-MESH-SPOOF: " drop
+}
+```
+`jump` transfers control to `mesh_input` which always terminates with `accept` or `drop`. The second rule was unreachable. `XNFT-MESH-SPOOF:` never appeared in logs. Any monitoring built on that prefix was silently broken.
+
+**Fix:** Spoof check moved before the jump.
+
+---
+
+### BUG 1B / 2A — Conntrack invalid check bypassed for mesh traffic
+
+All `wg0` packets entered `mesh_input` and hit `jump services` before the `ct state invalid drop` in `30-established.nft`. A compromised mesh peer could send invalid-state packets directly to services.
+
+**Fix:** Conntrack checks (`ct invalid` drop + `ct established` accept) added at the top of `mesh_input`.
+
+---
+
+### BUG 3A — WireGuard rate limit was a single shared bucket
+
+```nft
+udp dport 51820 limit rate 20/minute accept  # global counter
+```
+One attacker sending 20 UDP/minute exhausted the entire budget. All other legitimate peers hit the rate limit for the rest of that minute window. Classic deny-of-service against the WireGuard endpoint itself.
+
+**Fix:** Replaced with a `meter` — one independent token bucket per source IP.
+
+---
+
+### BUG 4B — `nd-redirect` accepted from any source (IPv6 MITM)
+
+ICMPv6 Redirect (type 137) instructs the host to change its first-hop router for a destination. Accepting it from any source allowed an attacker on the same network segment to silently redirect IPv6 connections through their machine. RFC 4861 §8.1 requires redirects come from the current first-hop router only, which on a WireGuard mesh doesn't apply.
+
+**Fix:** `nd-redirect` removed from the NDP accept list; explicit log+drop rule added.
+
+---
+
+### BUG 7A — Break-glass SSH was permanently unreachable
+
+The `ADMIN_ALLOWLIST` SSH rule was inside the `services` chain, which is only reachable from `mesh_input`, which only fires for `iifname "wg0"` traffic. When WireGuard goes down (the exact scenario requiring break-glass), the rule never fired.
+
+**Fix:** Break-glass rule moved to the `input` chain, before the `wg0` jump, with its own rate limit.
+
+---
+
+### BUG 9A — Forward chain dropped all established forwarded traffic
+
+The forward chain had `policy drop` but no `ct state established accept`. WireGuard hub routing (where this host forwards traffic between mesh peers) silently dropped all forwarded connections.
+
+**Fix:** `ct invalid` drop + `ct established` accept added to forward chain in `70-logging.nft`.
+
+---
+
+### BUG 10A — `flush ruleset` destroyed Docker/libvirt NAT rules
+
+`flush ruleset` removes ALL tables across ALL families — including Docker's `ip nat` and `ip filter` tables. Docker doesn't reinject them until restart. After any nftables reload, container networking silently broke.
+
+**Fix:** Replaced `flush ruleset` with scoped table operations:
+```nft
+add table inet filter
+delete table inet filter
+```
+Only the `inet filter` table is touched. Docker's tables are untouched.
+
+---
+
+### BUG 13A — Unsafe reload left machine open on syntax error
+
+`flush ruleset` (now fixed as 10A) executed immediately when encountered. A syntax error in any subsequent include caused: rules flushed, load aborted, machine left with no firewall.
+
+**Fix:** `reload.sh` script validates with `nft -c` before applying. Scoped table flush means a failed load leaves the old rules intact rather than leaving nothing.
 
 ---
 
 ## nftables primer
 
-If you are coming from `iptables`, here is the mental model shift.
-
 ### Tables and chains
 
-In `iptables` the tables (`filter`, `nat`, `mangle`) are fixed.  In nftables you create your own tables with any name, and define which hooks (input, forward, output, prerouting, postrouting) they attach to, and at what priority.
+In `iptables` the tables (`filter`, `nat`, `mangle`) are fixed. In nftables you create your own tables with any name, and define which hooks they attach to and at what priority.
 
 ```nft
 table inet filter {        # "inet" = covers IPv4 + IPv6 simultaneously
     chain input {
         type filter        # hook type: filter, nat, or route
         hook input         # netfilter hook: input, forward, output, prerouting, postrouting
-        priority filter;   # numeric priority or named alias (filter = 0)
+        priority filter;   # priority 0; use "raw" (-300) for early-exit optimisation
         policy drop;       # default verdict if no rule matches
     }
 }
@@ -499,44 +601,38 @@ table inet filter {        # "inet" = covers IPv4 + IPv6 simultaneously
 
 ```nft
 [match expressions]  [statement]  [comment]
-```
 
-Examples:
-
-```nft
-# Match on interface + protocol + port, then accept
+# Examples:
 iifname "wg0"  ip protocol tcp  tcp dport 22  accept  comment "SSH from mesh"
-
-# Match on conntrack state
 ct state { established, related }  accept  comment "conntrack fast-path"
-
-# Match on IP set membership
 ip saddr @MESH_PEERS  jump services  comment "known peer"
-
-# Rate-limit + log + drop
-limit rate 5/second  log prefix "DROP: " drop  comment "rate-limited drop"
+meter syn_flood { ip saddr limit rate 30/second }  comment "SYN rate-limit"
+limit rate 5/second  log prefix "DROP: "  drop  comment "rate-limited drop"
 ```
 
-### Sets and maps
+### Sets and meters
 
-Sets are one of nftables' most powerful features — you can match against lists or ranges of IPs, ports, or any data type in a single rule:
-
+**Sets** match against lists or ranges in O(1):
 ```nft
-# Named set — static list
-set BLOCKED_COUNTRIES {
+set BOGON_V4 {
     type ipv4_addr
     flags interval
-    elements = { 1.0.0.0/8, 2.0.0.0/8 }
+    elements = { 10.0.0.0/8, 192.168.0.0/16, 172.16.0.0/12 }
 }
-
-# Match against the set
-ip saddr @BLOCKED_COUNTRIES drop comment "geo-block"
+ip saddr @BOGON_V4 drop
 ```
 
-Verdict maps (`vmap`) let you jump to different chains based on a key:
-
+**Meters** (named sets with `dynamic` flag) create per-source token buckets:
 ```nft
-# Route traffic to different chains based on destination port
+# Each source IP gets its own independent bucket
+tcp flags syn  meter syn_flood { ip saddr timeout 10s limit rate 30/second }  accept
+```
+Without a meter, `limit rate 30/second` is a single global counter — one source exhausts the budget for everyone.
+
+### Verdict maps
+
+Route traffic to different chains based on a key — avoids long if/else chains:
+```nft
 tcp dport vmap {
     22   : jump ssh_chain,
     80   : jump http_chain,
@@ -544,32 +640,24 @@ tcp dport vmap {
 }
 ```
 
-### Priorities
+### Atomic reload
 
-Chains at lower numeric priority run first.  Named aliases:
+```bash
+# This is atomic — old rules replaced in a single transaction:
+nft -f /etc/nftables/nftables.conf
+# If the file has errors, the old rules remain intact (with scoped flush).
+```
+
+### Priorities
 
 | Alias | Value | Use case |
 |---|---|---|
-| `raw` | -300 | Before conntrack — use for performance-critical drops |
-| `mangle` | -150 | Packet modification |
+| `raw` | -300 | Before conntrack — drop malicious packets before they enter state table |
+| `mangle` | -150 | Packet modification (TTL, DSCP) |
 | `filter` | 0 | Standard filtering (this ruleset) |
 | `security` | 50 | SELinux / AppArmor hooks |
 
-For most firewall use cases, `priority filter` (0) is correct.
-
-### Atomic ruleset reload
-
-Unlike iptables, nftables applies a ruleset atomically.  The `flush ruleset` + `include` pattern in `nftables.conf` means:
-
-1. New rules are compiled into a transaction
-2. Old rules are replaced atomically — there is no window where no rules are loaded
-3. If the new config has a syntax error, the old rules remain active
-
-This makes safe reloads trivial:
-
-```bash
-sudo nft -c -f /etc/nftables/nftables.conf && sudo nft -f /etc/nftables/nftables.conf
-```
+Moving `ct state invalid drop` to a `raw` priority chain would prevent invalid packets from entering the conntrack table at all — a performance and resource gain. See the "Advanced patterns" section.
 
 ---
 
@@ -577,87 +665,182 @@ sudo nft -c -f /etc/nftables/nftables.conf && sudo nft -f /etc/nftables/nftables
 
 | | iptables | nftables |
 |---|---|---|
-| IPv4 + IPv6 | Separate `iptables` / `ip6tables` commands | Single `inet` table covers both |
-| Rule evaluation | Linear scan of every rule | JIT-compiled bytecode, set-based O(1) lookups |
-| Atomic reload | Not atomic — race window during reload | Fully atomic transactions |
-| Named sets | Requires `ipset` as a separate tool | Built-in, first-class feature |
-| Rule comments | Not supported natively | `comment` field on every rule |
-| Scripting | Fragile shell string concatenation | Proper include system, variables, maps |
-| Maintenance status | Legacy — no new features | Actively maintained, in-kernel since 3.13 |
+| IPv4 + IPv6 | Separate `iptables` / `ip6tables` | Single `inet` table |
+| Rule evaluation | Linear scan | JIT bytecode, O(1) set lookups |
+| Atomic reload | Not atomic | Fully atomic transactions |
+| Named sets | Requires external `ipset` | Built-in, first-class |
+| Per-source rate limit | Requires `hashlimit` module | Native `meter` |
+| Rule comments | Not supported | `comment` field on every rule |
+| Scripting | Shell string concatenation | Include system, variables, maps |
+| Maintenance | Legacy — no new features | Actively developed |
 
-`iptables` still works (it's now a compatibility shim over nftables on modern distros), but there is no reason to use it for new deployments.
+`iptables` is now a compatibility shim over nftables on modern distros (`iptables-legacy` calls `nft` internally). There is no reason to use it for new deployments.
 
 ---
 
 ## Why WireGuard over OpenVPN / IPsec
 
-| | OpenVPN | IPsec (strongSwan/Libreswan) | WireGuard |
+| | OpenVPN | IPsec (strongSwan) | WireGuard |
 |---|---|---|---|
 | Codebase size | ~70,000 lines | ~400,000 lines | ~4,000 lines |
-| Attack surface | Large (userspace TLS stack) | Very large | Minimal |
-| Performance | ~200–400 Mbps | ~400–600 Mbps | Line-rate on modern hardware |
-| Key exchange | TLS certificates or PSK | IKEv1/IKEv2 (complex) | Noise protocol (modern, simple) |
-| Configuration | Complex (many options) | Very complex | Simple (5–10 lines per peer) |
-| Kernel integration | Userspace daemon | Partial kernel support | Native in-kernel since 5.6 |
-| Roaming support | Limited | Limited | Automatic (peers reconnect seamlessly) |
-| Audit friendliness | Hard (large codebase) | Very hard | Straightforward |
+| Attack surface | Large (userspace TLS) | Very large | Minimal |
+| Performance | ~200–400 Mbps | ~400–600 Mbps | Line-rate |
+| Key exchange | TLS / certificates | IKEv1/IKEv2 | Noise Protocol |
+| Configuration | Complex | Very complex | 5–10 lines per peer |
+| Kernel integration | Userspace daemon | Partial | Native (kernel 5.6+) |
+| Roaming | Limited | Limited | Automatic |
 
-WireGuard's cryptographic foundation is the [Noise Protocol Framework](https://noiseprotocol.org/) with:
-- **Curve25519** for Diffie-Hellman key exchange
-- **ChaCha20-Poly1305** for authenticated encryption
-- **BLAKE2s** for hashing
-- **SipHash24** for hashtable keys
+WireGuard's cryptographic primitives:
+- **Curve25519** — Diffie-Hellman key exchange
+- **ChaCha20-Poly1305** — authenticated encryption
+- **BLAKE2s** — hashing
+- **SipHash24** — hashtable keys
 
-These are modern, well-audited primitives.  There are no negotiable cipher suites — no downgrade attacks, no BEAST/POODLE-class vulnerabilities.
+No negotiable cipher suites. No downgrade attacks. No BEAST/POODLE-class vulnerabilities.
 
 ---
 
 ## Threat modelling
 
-### The attacker from the internet
+### The internet scanner
 
-They find your server IP (trivial — it's in DNS, BGP, certificate transparency logs).  They run:
-
+They find your server IP (it's in DNS, BGP, certificate transparency logs). They run:
 ```
-nmap -sS -sV -O -p 1-65535 your.server.ip
+nmap -sS -sV -O -p- your.server.ip
 ```
 
-What they see with `xnftables` active:
-
+With `xnftables` active:
 ```
-Host is up (0.0034s latency).
 Not shown: 65534 filtered tcp ports (no-response)
 PORT      STATE         SERVICE
 51820/udp open|filtered unknown
 ```
 
-One port.  No banner.  No service version.  No OS fingerprint.  No attack surface.
+One port. No banner. No service version. No OS fingerprint.
 
-Without `xnftables` (default Ubuntu install):
-
+Without it (default Ubuntu):
 ```
 PORT   STATE SERVICE VERSION
 22/tcp open  ssh     OpenSSH 9.6p1 Ubuntu
 80/tcp open  http    nginx 1.26.0
-443/tcp open  https   nginx 1.26.0
+443/tcp open https   nginx 1.26.0
 ```
 
-Three services, exact versions, ready to be matched against CVE databases.
+Three services, exact versions, ready for CVE matching.
+
+### The TCP scanner
+
+Stealth scanners use invalid TCP flag combinations to probe without completing a handshake:
+
+```
+nmap -sN your.server.ip   # NULL scan: no flags
+nmap -sX your.server.ip   # XMAS scan: FIN+PSH+URG
+nmap -sF your.server.ip   # FIN scan: bare FIN
+```
+
+`05-antiscan.nft` drops all of these with dedicated log prefixes, so you can see the scan attempt in logs and correlate with other activity.
 
 ### The compromised mesh peer
 
-WireGuard guarantees authentication, not authorisation.  A peer with a valid key pair can reach all services that `rules/40-services.nft` opens.  Mitigations:
+WireGuard guarantees authentication, not authorisation. A peer with a valid key pair can reach all services that `40-services.nft` opens. Mitigations:
 
-1. **Per-peer sub-chains** — route each peer's traffic to a dedicated chain with only the services they need
-2. **Revoke immediately** — remove the peer's `[Peer]` block from `wg0.conf` and run `wg syncconf wg0 <(wg-quick strip wg0)` to revoke without restarting the interface
-3. **Principle of least privilege** — don't expose services a peer doesn't need
-4. **mTLS at the application layer** — add client certificate auth to sensitive services so a network-level compromise isn't sufficient
+1. **Per-peer sub-chains** (see Advanced patterns)
+2. **Immediate revocation** — `wg syncconf wg0 <(wg-quick strip wg0)` without restart
+3. **mTLS at the application layer** — client certificates for sensitive services
+4. **Egress control** — if a peer is compromised, limit what it can reach from this host
 
-### The insider / supply chain attack
+### Off-path ICMP attacks
 
-If you run software that has a network listener (a web app, a database, an agent), and that software is compromised, it may try to exfiltrate data or phone home.  The default `output: accept` policy doesn't prevent this.
+Even with the source restriction on `echo-request`, `destination-unreachable` must be accepted from the internet (required for PMTUD). An off-path attacker who knows a TCP connection's 4-tuple (src IP, src port, dst IP, dst port) can:
 
-To mitigate: enable egress control (see [Advanced patterns](#advanced-patterns)) and restrict outbound connections to known-good destinations.
+- Send a forged `type 3 code 4` (frag-needed) with `MTU=68` — forces retransmission at minimum size, crushing throughput
+- Send a forged `type 3 code 1` (host unreachable) — can terminate a TCP connection
+
+These attacks require knowing the 4-tuple (difficult but not impossible for long-lived connections). Mitigation: the rate limit on ICMP essential types (10/s) bounds the impact. For high-security environments, consider restricting `destination-unreachable` to `ct state established` only — at the cost of potential PMTUD issues for new connections.
+
+---
+
+## Docker / Podman / LXC interaction
+
+Container runtimes inject their own nftables/iptables rules for NAT and forwarding. Understanding the interaction is critical.
+
+### Docker
+
+Docker manages two nftables-compatible tables in the `ip` family (IPv4 only):
+- `ip nat` — DNAT for port forwarding (`-p 8080:80`), MASQUERADE for egress
+- `ip filter` — the `DOCKER` and `DOCKER-USER` chains
+
+**The `flush ruleset` problem (BUG 10A):** `flush ruleset` destroys ALL tables in ALL families, including Docker's. Container networking breaks silently. `xnftables` uses scoped flush (`add table / delete table`) to avoid this.
+
+**Port exposure conflict:** If Docker exposes a container port (`-p 8080:80`), it adds DNAT rules to `ip nat` that bypass the `inet filter` table entirely. A container port published with `-p` is reachable from the internet even if `inet filter` drops port 8080.
+
+To fix this: either use `--network=host` containers managed by nftables directly, or add DOCKER-USER rules:
+```bash
+# Block all container port-forward access from the internet
+# (allow only from mesh peers or localhost)
+iptables -I DOCKER-USER -i eth0 ! -s 10.10.0.0/24 -j DROP
+```
+
+Or use `docker run --network=none` / `--network=container:name` for containers that should only talk on the mesh.
+
+**Best practice:** Run containers without `-p` port publishing. Access them via their mesh IP if the container host is a WireGuard peer, or via a reverse proxy on the mesh.
+
+### Podman (rootless)
+
+Rootless Podman uses `pasta` or `slirp4netns` for networking, which operates in user namespaces. It doesn't touch the host's nftables tables. No conflict.
+
+Rootful Podman behaves like Docker and has the same DNAT bypass issue.
+
+### LXC / LXD
+
+LXD creates a bridge interface (`lxdbr0`) and manages forwarding via iptables-compat. The `flush ruleset` issue applies. Use scoped flush (already in `xnftables`) and add forwarding rules if needed:
+
+```nft
+chain forward {
+    # Allow LXD container traffic
+    iifname "lxdbr0" accept comment "forward: LXD bridge egress"
+    oifname "lxdbr0" accept comment "forward: LXD bridge ingress"
+}
+```
+
+---
+
+## Tailscale / Netbird / Headscale adaptation
+
+`xnftables` uses WireGuard directly. Tailscale, Netbird, and Headscale are control-plane layers on top of WireGuard — the nftables policy adapts with minimal changes.
+
+### Tailscale
+
+Tailscale manages WireGuard via its own daemon and creates a `tailscale0` interface. Replace `wg0` with `tailscale0`:
+
+```nft
+# 20-mesh.nft — change interface name
+iifname "tailscale0" jump mesh_input
+
+# 05-antiscan.nft — exclude tailscale interface from bogon filter
+iifname != "tailscale0" ip saddr @BOGON_V4 drop
+```
+
+Tailscale assigns IPs from `100.64.0.0/10` (CGNAT space) by default. Update `MESH_PEERS`:
+```nft
+set MESH_PEERS {
+    type ipv4_addr
+    flags interval
+    elements = { 100.64.0.0/10 }  # Tailscale CGNAT range
+}
+```
+
+And remove `100.64.0.0/10` from `BOGON_V4` (it's in there by default as RFC6598).
+
+WireGuard port: Tailscale uses ephemeral UDP ports, not 51820. Remove or comment out `50-vpn-endpoint.nft` — Tailscale manages its own NAT traversal.
+
+### Netbird
+
+Netbird also creates a WireGuard interface (typically `wt0`) with a configurable CIDR. Substitute `wt0` for `wg0` and your Netbird CIDR for `10.10.0.0/24`.
+
+### Headscale (self-hosted Tailscale coordinator)
+
+Interface is still `tailscale0`. Changes are identical to the Tailscale section above.
 
 ---
 
@@ -665,167 +848,159 @@ To mitigate: enable egress control (see [Advanced patterns](#advanced-patterns))
 
 ### Per-peer isolation
 
-If you want peer `10.10.0.2` (Alice's workstation) to reach SSH but NOT the database, and `10.10.0.3` (a CI server) to reach the database but NOT SSH:
+Limit what each mesh peer can reach:
 
 ```nft
 chain services {
-    # Alice: SSH only
+    # Alice's workstation: SSH only
     ip saddr 10.10.0.2 tcp dport 22    accept comment "peer alice: SSH"
     ip saddr 10.10.0.2                 drop   comment "peer alice: deny all else"
 
-    # CI server: PostgreSQL only
+    # CI server: PostgreSQL and node exporter only
     ip saddr 10.10.0.3 tcp dport 5432  accept comment "peer ci: PostgreSQL"
+    ip saddr 10.10.0.3 tcp dport 9100  accept comment "peer ci: node exporter"
     ip saddr 10.10.0.3                 drop   comment "peer ci: deny all else"
-
-    # Default: log+drop (falls through to 70-logging.nft)
 }
 ```
 
 ### Output egress control
 
-Change the output policy to drop and add explicit egress rules:
-
 ```nft
 chain output {
     type filter hook output priority filter; policy drop;
-
     oifname "lo"                      accept comment "egress: loopback"
     ct state { established, related } accept comment "egress: established"
+    ct state invalid                  drop   comment "egress: invalid state"
     udp dport 53                      accept comment "egress: DNS"
     tcp dport 53                      accept comment "egress: DNS/TCP"
     udp dport 123                     accept comment "egress: NTP"
-    tcp dport { 80, 443 }             accept comment "egress: HTTP/HTTPS (updates, APIs)"
-    udp dport 51820                   accept comment "egress: WireGuard (if this host is also a peer)"
+    tcp dport { 80, 443 }             accept comment "egress: HTTP/HTTPS"
+    udp dport 51820                   accept comment "egress: WireGuard"
     log prefix "XNFT-EGRESS-DROP: "   drop   comment "egress: catch-all"
 }
 ```
 
-### Mesh peer routing (WireGuard server as hub)
-
-If this host is the WireGuard server and peers need to reach each other (hub-and-spoke):
+### Mesh hub routing (WireGuard server forwards between peers)
 
 ```nft
 chain forward {
     type filter hook forward priority filter; policy drop;
-
-    # Mesh-to-mesh forwarding through this hub
+    ct state invalid  drop
+    ct state { established, related }  accept
     iifname "wg0" oifname "wg0"
         ip saddr @MESH_PEERS ip daddr @MESH_PEERS
         accept comment "forward: mesh-to-mesh via hub"
-
-    log prefix "XNFT-FWD-DROP: " drop comment "forward: catch-all"
+    log prefix "XNFT-FWD-DROP: " drop
 }
 ```
 
-### Dynamic peer sets
+### Connection rate limiting per service
 
-For environments with many peers or dynamic membership, populate `@MESH_PEERS` from a script:
+```nft
+tcp dport 22 ct state new \
+    limit rate 6/minute \
+    accept comment "service: SSH new-conn rate-limit"
+tcp dport 22 ct state new \
+    log prefix "XNFT-SSH-RATELIMIT: " drop comment "service: SSH rate exceeded"
+tcp dport 22 accept comment "service: SSH"
+```
+
+### Early invalid-drop at raw priority (performance)
+
+Moving `ct state invalid` to the `raw` hook prevents invalid packets from entering the conntrack table at all, which is a significant resource saving under flood conditions:
+
+```nft
+table inet raw {
+    chain prerouting {
+        type filter hook prerouting priority raw; policy accept;
+        ct state invalid  log prefix "XNFT-RAW-INVALID: " drop
+        # Optional: notrack for high-volume UDP flows that don't need state
+        # udp dport 51820  notrack
+    }
+}
+```
+
+### Port knocking (pure nftables)
+
+Open SSH only after a specific sequence of connection attempts:
+
+```nft
+table inet portknock {
+    set step1 { type ipv4_addr; flags dynamic, timeout; timeout 5s }
+    set open  { type ipv4_addr; flags dynamic, timeout; timeout 30s }
+
+    chain input {
+        type filter hook input priority filter - 1; policy accept;
+        tcp dport 7000 ct state new add @step1 { ip saddr } drop
+        tcp dport 8000 ip saddr @step1 ct state new add @open { ip saddr } drop
+        tcp dport 22   ip saddr != @open drop
+    }
+}
+```
+
+### Dynamic peer sync from WireGuard state
+
+Keep `@MESH_PEERS` in sync with the actual WireGuard peer list:
 
 ```bash
 #!/bin/bash
-# sync-mesh-peers.sh — rebuild the MESH_PEERS set from active WireGuard peers
+# scripts/sync-peers.sh
 nft flush set inet filter MESH_PEERS
 wg show wg0 allowed-ips | awk '{print $2}' | while read cidr; do
     nft add element inet filter MESH_PEERS "{ $cidr }"
 done
 ```
 
-Run via a `PostUp` hook in `wg0.conf` or a systemd timer.
-
-### Connection rate limiting per service
-
-Protect services from connection floods even from inside the mesh:
-
-```nft
-# Limit SSH to 3 new connections per minute per source IP
-tcp dport 22 ct state new \
-    limit rate 3/minute \
-    accept comment "service: SSH rate-limited (mesh-only)"
-
-tcp dport 22 ct state new \
-    log prefix "XNFT-SSH-RATELIMIT: " \
-    drop comment "service: SSH rate-limit exceeded"
-```
-
-### Port knocking (software-defined firewall)
-
-Open a port only after receiving a specific sequence of connection attempts.  Pure nftables implementation:
-
-```nft
-table inet portknock {
-    set knocked {
-        type ipv4_addr
-        flags dynamic, timeout
-        timeout 10s          # IP removed from set after 10s of no activity
-    }
-
-    chain input {
-        type filter hook input priority filter - 1; policy accept;
-
-        # Step 1: knock on 7000 → add to "knocked" set
-        tcp dport 7000 ct state new add @knocked { ip saddr timeout 5s } drop
-
-        # Step 2: if in "knocked" and knocks 8000 → open SSH for 30s
-        tcp dport 8000 ip saddr @knocked ct state new \
-            add @open { ip saddr timeout 30s } drop
-
-        # Block SSH unless in the "open" set
-        tcp dport 22 ip saddr != @open drop
-    }
-
-    set open {
-        type ipv4_addr
-        flags dynamic, timeout
-        timeout 30s
-    }
-}
-```
-
-### Geo-blocking with named sets
-
-Block entire country CIDRs (e.g. using [ipverse.net](https://ipverse.net/ipblocks/data/countries/) country IP blocks):
-
-```nft
-set BLOCKED_PREFIXES {
-    type ipv4_addr
-    flags interval
-    elements = {
-        # Add country CIDR blocks here
-        # e.g. 1.0.0.0/8,
-    }
-}
-
-chain input {
-    ip saddr @BLOCKED_PREFIXES \
-        log prefix "XNFT-GEOBLOCK: " \
-        drop comment "geo-block: blocked prefix"
-}
-```
-
-Note: geo-blocking is a speed bump, not a wall — determined attackers use exit nodes in unblocked countries.  Useful for noise reduction, not for security guarantees.
+Run via `PostUp` in `wg0.conf` or a systemd timer.
 
 ---
 
 ## Hardening checklist
 
-Use this as a pre-deploy review before putting a server into production.
-
 ```
-[ ] MESH_PEERS set contains only your mesh CIDR — no 0.0.0.0/0
-[ ] WireGuard interface name matches your actual wg interface (wg0 / wg1 / etc.)
+Network layer
+[ ] MESH_PEERS contains only your mesh CIDR — not 0.0.0.0/0
+[ ] MESH_PEERS6 is either populated or explicitly documented as unused
+[ ] BOGON_V4 in 00-tables.nft reviewed — no ranges removed without reason
+[ ] WireGuard interface name matches across all rule files (wg0, wt0, tailscale0…)
 [ ] ListenPort in wg0.conf matches udp dport in 50-vpn-endpoint.nft
 [ ] Only services this host actually runs are uncommented in 40-services.nft
-[ ] Every uncommented rule has a comment field
-[ ] nft -c validates without errors
-[ ] nftables.service is enabled for boot persistence
-[ ] WireGuard private keys are chmod 600, not committed to git
-[ ] Peers use AllowedIPs = <their IP>/32 (not 0.0.0.0/0 unless intentional)
+[ ] Every uncommented rule has a comment= field
+
+WireGuard
+[ ] Private keys are chmod 600 and not committed to git
+[ ] Each peer uses AllowedIPs = <their IP>/32 (not 0.0.0.0/0 unless intentional)
 [ ] PersistentKeepalive set on mobile/roaming peers
-[ ] Log shipping configured (rsyslog / journald remote)
-[ ] Tested: SSH from mesh peer works
-[ ] Tested: SSH from public internet does NOT work
-[ ] Tested: WireGuard handshake from new peer works
-[ ] Tested: nmap from public internet shows only UDP/51820
+[ ] Pre-shared keys generated and used (post-quantum protection layer)
+
+Break-glass
+[ ] ADMIN_ALLOWLIST contains a real, routable IP (NOT 192.0.2.x/198.51.100.x/203.0.113.x)
+[ ] The emergency back-door has been tested from the allowlist IP before you need it
+
+Reload safety
+[ ] nftables.service is enabled for boot persistence
+[ ] reload.sh is used for all rule changes (not nft -f directly)
+[ ] Pre-commit hook installed: cp scripts/check.sh .git/hooks/pre-commit
+
+Kernel settings (complement to nftables rules)
+[ ] net.ipv4.tcp_syncookies = 1  (SYN cookie protection)
+[ ] net.ipv4.conf.all.rp_filter = 1  (kernel-level reverse-path filtering)
+[ ] net.ipv4.conf.all.log_martians = 1  (kernel martian logging as second opinion)
+[ ] net.ipv4.conf.all.accept_redirects = 0  (no ICMP redirects)
+[ ] net.ipv6.conf.all.accept_redirects = 0
+
+Logging
+[ ] Log shipping configured (rsyslog/journald → SIEM or Loki)
+[ ] Alert on XNFT-BREAKGLASS-RATELIMIT (someone is trying the emergency back-door)
+[ ] Alert on XNFT-MESH-SPOOF (something suspicious inside the tunnel)
+
+Testing
+[ ] SSH from mesh peer works
+[ ] SSH from public internet does NOT work
+[ ] WireGuard handshake from new peer works
+[ ] nmap from public internet shows only UDP/51820
+[ ] nmap -sN/-sX/-sF shows all ports filtered (TCP scan protection working)
+[ ] Container networking (if applicable) works after nftables reload
 ```
 
 ---
@@ -842,19 +1017,21 @@ Use this as a pre-deploy review before putting a server into production.
 
 ## References
 
-- [nftables wiki](https://wiki.nftables.org/) — canonical reference for syntax and concepts
-- [nftables Quick Reference](https://wiki.nftables.org/wiki-nftables/index.php/Quick_reference-nftables_in_10_minutes) — 10-minute overview
-- [WireGuard documentation](https://www.wireguard.com/) — protocol design and configuration
-- [WireGuard whitepaper](https://www.wireguard.com/papers/wireguard.pdf) — academic paper with cryptographic protocol details
-- [Noise Protocol Framework](https://noiseprotocol.org/) — cryptographic foundation of WireGuard
-- [Netfilter conntrack](https://conntrack-tools.netfilter.org/) — connection tracking subsystem
-- [Linux Kernel WireGuard docs](https://www.kernel.org/doc/html/latest/networking/wireguard.html)
+- [nftables wiki](https://wiki.nftables.org/) — canonical reference
+- [nftables Quick Reference](https://wiki.nftables.org/wiki-nftables/index.php/Quick_reference-nftables_in_10_minutes)
+- [WireGuard documentation](https://www.wireguard.com/)
+- [WireGuard whitepaper](https://www.wireguard.com/papers/wireguard.pdf)
+- [Noise Protocol Framework](https://noiseprotocol.org/) — WireGuard's cryptographic foundation
+- [RFC 4861](https://www.rfc-editor.org/rfc/rfc4861) — IPv6 Neighbour Discovery (nd-redirect rules)
+- [RFC 1918](https://www.rfc-editor.org/rfc/rfc1918) — private address space (BOGON_V4)
+- [RFC 5737](https://www.rfc-editor.org/rfc/rfc5737) — documentation IPs (never use in production)
+- [Linux conntrack tuning](https://www.kernel.org/doc/html/latest/networking/nf_conntrack-sysctl.rst)
 - [nft(8) man page](https://www.netfilter.org/projects/nftables/manpage.html)
-- [ipverse country IP blocks](https://ipverse.net/ipblocks/data/countries/) — CIDR lists for geo-blocking
+- [ipverse country IP blocks](https://ipverse.net/ipblocks/data/countries/) — for geo-blocking
 
 ---
 
 ## License
 
-MIT — use it, adapt it, share it.  
+MIT — use it, adapt it, share it.
 If you improve it, send a PR.

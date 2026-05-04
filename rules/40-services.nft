@@ -2,27 +2,35 @@
 # 40-services.nft — Explicit per-service allowlist (mesh peers only)
 # =============================================================================
 # Every rule here has:
-#   1. A protocol + port
-#   2. A comment naming the service
+#   1. A transport protocol + destination port
+#   2. A comment= naming the service and its purpose
 #   3. An optional rate-limit or connection-limit for abuse prevention
 #
-# Rules in this chain only fire for packets that already passed 20-mesh.nft.
-# That means ip saddr is guaranteed to be in @MESH_PEERS — no need to repeat
-# the source check.
+# Rules in the services chain fire ONLY for packets that passed 20-mesh.nft:
+#   - Source is guaranteed to be in @MESH_PEERS (or @MESH_PEERS6)
+#   - Conntrack invalid packets have already been dropped
+#   - Established connections have already been accepted (fast-path)
+#
+# The break-glass ADMIN_ALLOWLIST rule is intentionally NOT here.
+# It lives in the input chain in 20-mesh.nft, before the wg0 jump,
+# so it fires even when WireGuard is completely down.
+# (BUG 7A fix — services chain is only reachable via wg0)
 #
 # HOW TO ADD A SERVICE
 # --------------------
 # 1. Uncomment the relevant block below, or copy the template at the end.
-# 2. Use the most specific match possible (proto + dport, not just dport).
-# 3. Add a comment= that names the service and its purpose.
-# 4. Reload: nft -f /etc/nftables/nftables.conf
-# 5. Verify: nft list ruleset | grep <port>
-# 6. Commit the change with a message explaining WHY it was added.
+# 2. Use protocol + port (not just dport alone).
+# 3. Add a comment= naming the service and why it's open.
+# 4. Dry-run:  sudo nft -c -f /etc/nftables/nftables.conf
+# 5. Reload:   sudo ./scripts/reload.sh
+# 6. Verify:   sudo nft list chain inet filter services
+# 7. Test:     nc -zv <mesh-peer-ip> <port>  (from a mesh peer)
+# 8. Commit:   git commit -m "feat: open TCP/<PORT> for <NAME>"
 #
 # HOW TO REMOVE A SERVICE
 # -----------------------
-# Delete or comment-out the line, reload, commit.
-# The audit trail lives in git — never just silently delete a rule.
+# Comment out (don't delete) the line, reload, test, commit.
+# The git diff is the audit trail — deletion loses history.
 # =============================================================================
 
 table inet filter {
@@ -31,32 +39,46 @@ table inet filter {
         # -----------------------------------------------------------------------
         # SSH — remote shell (mesh peers only)
         # -----------------------------------------------------------------------
-        # Only reachable from inside the mesh. Change port if you run SSH on
-        # a non-standard port (recommended: e.g. 2222).
+        # Rate-limited: 6 new connections/minute per source prevents automated
+        # brute-force even from a mesh peer (e.g. a compromised node).
+        # Change to port 2222 (or any other port) if preferred — but mesh-only
+        # access is already a strong enough deterrent that obscurity adds little.
+        tcp dport 22 ct state new \
+            limit rate 6/minute \
+            accept comment "service: SSH new conn rate-limit (mesh-only)"
+
+        tcp dport 22 ct state new \
+            log prefix "XNFT-SSH-RATELIMIT: " level info \
+            drop comment "service: SSH rate-limit exceeded"
+
         tcp dport 22 accept comment "service: SSH (mesh-only)"
 
         # -----------------------------------------------------------------------
         # HTTP / HTTPS — web services
         # -----------------------------------------------------------------------
-        # Uncomment if this host serves web content to mesh peers.
-        # If the host faces the public internet via a reverse proxy (e.g. Caddy,
-        # nginx) on ANOTHER node, keep this commented and access via that proxy's
-        # mesh IP instead.
+        # Uncomment if this host serves web content to mesh peers directly.
+        # If the host sits behind a reverse proxy (Caddy, nginx, Traefik) on
+        # ANOTHER mesh node, keep this commented — access via that proxy's
+        # mesh IP instead, and expose only what the proxy needs.
         # tcp dport { 80, 443 } accept comment "service: HTTP/HTTPS (mesh-only)"
 
         # -----------------------------------------------------------------------
         # DNS — recursive resolver
         # -----------------------------------------------------------------------
-        # Uncomment if this host runs a DNS resolver (e.g. Unbound, Pi-hole,
-        # CoreDNS) for mesh peers.
+        # Uncomment if this host runs a DNS resolver (Unbound, Pi-hole, CoreDNS).
         # tcp dport 53 accept comment "service: DNS/TCP (mesh-only)"
         # udp dport 53 accept comment "service: DNS/UDP (mesh-only)"
 
         # -----------------------------------------------------------------------
         # Prometheus node exporter
         # -----------------------------------------------------------------------
-        # Exposes host metrics to a Prometheus scraper running on another mesh peer.
+        # Exposes host metrics to a Prometheus scraper on another mesh peer.
         # tcp dport 9100 accept comment "service: Prometheus node exporter (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Prometheus Alertmanager
+        # -----------------------------------------------------------------------
+        # tcp dport 9093 accept comment "service: Alertmanager (mesh-only)"
 
         # -----------------------------------------------------------------------
         # Grafana
@@ -74,23 +96,25 @@ table inet filter {
         # tcp dport 6379 accept comment "service: Redis (mesh-only)"
 
         # -----------------------------------------------------------------------
-        # Custom application port — template
+        # MinIO / S3-compatible object storage
+        # -----------------------------------------------------------------------
+        # tcp dport 9000 accept comment "service: MinIO API (mesh-only)"
+        # tcp dport 9001 accept comment "service: MinIO console (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Loki (log aggregation)
+        # -----------------------------------------------------------------------
+        # tcp dport 3100 accept comment "service: Loki HTTP (mesh-only)"
+
+        # -----------------------------------------------------------------------
+        # Custom application port — copy this template
         # -----------------------------------------------------------------------
         # tcp dport <PORT> accept comment "service: <NAME> — <WHY> (mesh-only)"
         # udp dport <PORT> accept comment "service: <NAME> — <WHY> (mesh-only)"
 
         # -----------------------------------------------------------------------
-        # Admin SSH from explicit allowlist (break-glass only)
-        # -----------------------------------------------------------------------
-        # If ADMIN_ALLOWLIST is populated in 00-tables.nft, this permits SSH
-        # from those IPs even on the public interface — use only for emergency
-        # access when the VPN is down.  Leave commented unless actively needed.
-        # ip saddr @ADMIN_ALLOWLIST tcp dport 22 \
-        #     accept comment "service: SSH break-glass (admin allowlist)"
-
-        # -----------------------------------------------------------------------
-        # Catch-all: un-matched mesh traffic falls through and is logged+dropped
-        # by 70-logging.nft.  Do not add a default drop here — let logging fire.
+        # Catch-all: un-matched mesh traffic falls through to 70-logging.nft.
+        # Do NOT add a drop here — let logging fire first.
         # -----------------------------------------------------------------------
     }
 }

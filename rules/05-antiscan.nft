@@ -1,0 +1,144 @@
+# =============================================================================
+# 05-antiscan.nft — Bogon filtering, TCP flag abuse, SYN flood guard
+# =============================================================================
+# This file runs BEFORE loopback and mesh rules so that obviously malicious or
+# impossible packets are rejected at the earliest point in the chain, reducing
+# load on all subsequent rules.
+#
+# Three protection layers:
+#
+#   1. BOGON / MARTIAN FILTERING
+#      Packets with RFC1918, documentation, loopback, or reserved source IPs
+#      arriving on non-loopback interfaces are either spoofed or misconfigured.
+#      We drop them before any further evaluation.
+#      Set BOGON_V4 is defined in 00-tables.nft.
+#      Note: we exempt wg0 — mesh peers use RFC1918 space (10.10.0.0/24) by
+#      design.  Bogon filtering applies to the public-facing interface only.
+#
+#   2. TCP FLAG ABUSE
+#      Certain TCP flag combinations are never valid in normal traffic but are
+#      widely used in stealth port-scanning (nmap -sN/-sX/-sF) and some DoS
+#      tools.  We log and drop them.
+#
+#      Invalid flag combinations:
+#        NULL    — no flags set; used to elicit RST from closed ports
+#        XMAS    — FIN+PSH+URG set; "lights up like a Christmas tree"
+#        SYN+FIN — semantically impossible; both open and close at once
+#        FIN     — no SYN, no ACK, no RST; used in FIN scans
+#        SYN+RST — contradictory; indicates a malformed or spoofed packet
+#
+#   3. SYN FLOOD GUARD
+#      Limits the rate of new TCP connection attempts per source IP.
+#      This complements kernel-level SYN cookies (net.ipv4.tcp_syncookies).
+#      Enable SYN cookies as well:
+#        sysctl -w net.ipv4.tcp_syncookies=1
+#        echo "net.ipv4.tcp_syncookies = 1" >> /etc/sysctl.d/99-synflood.conf
+#
+#   4. FRAGMENT GUARD
+#      Fragmented packets are unusual in normal mesh traffic and commonly used
+#      in evasion attacks.  We log and drop IP fragments arriving on the public
+#      interface.  (WireGuard handles its own MTU and fragmentation internally.)
+#
+# IMPORTANT: The bogon filter explicitly skips wg0 (mesh peers use private
+# space).  If you add other internal interfaces, adjust the iifname guards.
+# =============================================================================
+
+table inet filter {
+    chain input {
+
+        # =====================================================================
+        # 1. BOGON / MARTIAN SOURCE ADDRESS FILTER
+        # =====================================================================
+        # Only apply to non-WireGuard interfaces — mesh peers legitimately
+        # use 10.10.0.0/24 (RFC1918) and would be blocked otherwise.
+        # iifname != "wg0" ensures this only fires on the public interface.
+
+        iifname != "wg0" ip saddr @BOGON_V4 \
+            log prefix "XNFT-BOGON: " level info \
+            drop comment "antiscan: bogon/martian source IPv4"
+
+        # Loopback addresses arriving on a non-loopback interface — impossible
+        # in normal operation; indicates IP stack misbehaviour or spoofing.
+        iifname != "lo" ip saddr 127.0.0.0/8 \
+            log prefix "XNFT-LOOPBACK-SPOOF: " level warn \
+            drop comment "antiscan: loopback source on non-lo iface"
+
+        iifname != "lo" ip6 saddr ::1/128 \
+            log prefix "XNFT-LOOPBACK6-SPOOF: " level warn \
+            drop comment "antiscan: IPv6 loopback source on non-lo iface"
+
+        # =====================================================================
+        # 2. TCP FLAG ABUSE
+        # =====================================================================
+
+        # NULL scan — no TCP flags set.
+        # RFC793 requires at least one flag.  Used to probe for closed ports
+        # on systems that send RST for closed ports (most Unix hosts).
+        tcp flags == 0x0 \
+            log prefix "XNFT-TCPFL-NULL: " level info \
+            drop comment "antiscan: TCP NULL scan (no flags)"
+
+        # XMAS scan — FIN + PSH + URG simultaneously.
+        # Named for the pattern on a packet analyser display.
+        tcp flags & (fin|psh|urg) == fin|psh|urg \
+            log prefix "XNFT-TCPFL-XMAS: " level info \
+            drop comment "antiscan: TCP XMAS scan (FIN+PSH+URG)"
+
+        # SYN + FIN — contradictory combination; a TCP segment cannot both
+        # initiate a connection (SYN) and request teardown (FIN).
+        tcp flags & (syn|fin) == syn|fin \
+            log prefix "XNFT-TCPFL-SYNFIN: " level info \
+            drop comment "antiscan: TCP SYN+FIN (impossible)"
+
+        # SYN + RST — also contradictory; used in some older DoS tools.
+        tcp flags & (syn|rst) == syn|rst \
+            log prefix "XNFT-TCPFL-SYNRST: " level info \
+            drop comment "antiscan: TCP SYN+RST (impossible)"
+
+        # FIN scan — FIN set without ACK.  Valid data-carrying FINs always
+        # appear within an established connection (ct state established covers
+        # those).  A bare FIN on a new connection is a scan.
+        tcp flags & (fin|ack) == fin \
+            ct state new \
+            log prefix "XNFT-TCPFL-FIN: " level info \
+            drop comment "antiscan: TCP FIN scan (bare FIN, new connection)"
+
+        # =====================================================================
+        # 3. SYN FLOOD GUARD (per-source rate limit on new connections)
+        # =====================================================================
+        # Meter creates an independent token bucket per source IP, so one
+        # flooding host cannot consume the budget of all others.
+        # Adjust the rate limit to taste; 30/second per-source is conservative.
+        #
+        # This does not replace kernel SYN cookies — enable those too:
+        #   sysctl -w net.ipv4.tcp_syncookies=1
+
+        tcp flags & syn == syn \
+            ct state new \
+            meter syn_flood { ip saddr timeout 10s limit rate 30/second } \
+            comment "antiscan: SYN rate-limit meter (per-source)"
+
+        tcp flags & syn == syn \
+            ct state new \
+            log prefix "XNFT-SYNFLOOD: " level warn \
+            drop comment "antiscan: SYN flood rate-limit exceeded"
+
+        # =====================================================================
+        # 4. IP FRAGMENT GUARD
+        # =====================================================================
+        # IP fragmentation is rarely seen in legitimate traffic to a server and
+        # is commonly exploited for firewall evasion (overlapping fragments,
+        # tiny fragment attacks) and to hide scan/exploit payloads.
+        #
+        # We drop fragmented packets arriving on the public interface.
+        # WireGuard's internal fragmentation (if any) is handled before these
+        # packets reach nftables, so wg0 is excluded.
+        #
+        # If your environment legitimately generates IP fragments (some tunnels,
+        # some UDP-based protocols), comment out the rule and document why.
+
+        iifname != "wg0" ip frag-off & 0x1fff != 0 \
+            log prefix "XNFT-FRAGMENT: " level info \
+            drop comment "antiscan: fragmented IPv4 packet (public iface)"
+    }
+}
