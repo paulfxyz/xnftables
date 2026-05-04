@@ -37,6 +37,7 @@
 - [Threat modelling](#threat-modelling)
 - [Docker / Podman / LXC interaction](#docker--podman--lxc-interaction)
 - [Tailscale / Netbird / Headscale adaptation](#tailscale--netbird--headscale-adaptation)
+- [Security monitoring](#security-monitoring)
 - [Advanced patterns](#advanced-patterns)
 - [Hardening checklist](#hardening-checklist)
 - [Tested on](#tested-on)
@@ -841,6 +842,48 @@ Netbird also creates a WireGuard interface (typically `wt0`) with a configurable
 ### Headscale (self-hosted Tailscale coordinator)
 
 Interface is still `tailscale0`. Changes are identical to the Tailscale section above.
+
+---
+
+## Security monitoring
+
+Rulesets rot.  Kernel netfilter patches land weekly.  New CVEs get published against `nftables` and `conntrack` without fanfare.  A rule that was correct today may have a known bypass tomorrow.
+
+`scripts/monitor/xnft-monitor.sh` is a weekday script that scans five upstream sources and pings you only when something security-relevant changes:
+
+| Source | What it detects |
+|---|---|
+| kernel.org | New stable kernel releases |
+| netfilter.org | New `nftables` / `nft` releases |
+| NVD CVE API | `nftables` / `netfilter` CVEs published in the last 7 days |
+| netfilter-devel mailing list | Thread subjects matching CVE, UAF, bypass, crash, heap overflow… |
+| kernel.org netfilter git | Recent `net/netfilter` commit subjects matching security keywords |
+
+Every finding is automatically mapped to the rule file most likely affected (a conntrack CVE → `rules/30-established.nft`, a WireGuard patch → `rules/20-mesh.nft` + `rules/50-vpn-endpoint.nft`, etc.) so the notification is immediately actionable.
+
+Notifications go to whichever of **Slack, Discord, email, Notion** you configure.  Only HIGH and CRITICAL findings trigger pings.  MEDIUM findings (new releases, API changes) go to Notion only.  Everything is logged to stdout.
+
+### Quickstart
+
+```bash
+cd scripts/monitor
+cp .env.example .env && $EDITOR .env   # fill in your webhook URLs / tokens
+chmod +x xnft-monitor.sh
+
+# Test — dry-run, no notifications sent
+DRY_RUN=1 ./xnft-monitor.sh
+
+# Add to crontab (weekdays at 08:00)
+crontab -e
+# 0 8 * * 1-5 /opt/xnftables/scripts/monitor/xnft-monitor.sh >> /var/log/xnft-monitor.log 2>&1
+
+# Or use the systemd timer
+sudo cp monitor.service /etc/systemd/system/xnft-monitor.service
+sudo cp monitor.timer   /etc/systemd/system/xnft-monitor.timer
+sudo systemctl enable --now xnft-monitor.timer
+```
+
+Full documentation: **[MONITOR.md](./MONITOR.md)**
 
 ---
 
