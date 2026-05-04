@@ -1,0 +1,17 @@
+# =============================================================================
+# xnftables .gitignore
+# =============================================================================
+
+# Monitor credentials — never commit tokens or webhook URLs
+scripts/monitor/.env
+scripts/monitor/.last-seen-versions
+
+# Runtime artefacts
+/tmp/xnft-findings-*.json
+*.log
+
+# Editor noise
+.DS_Store
+.vscode/
+*.swp
+*~

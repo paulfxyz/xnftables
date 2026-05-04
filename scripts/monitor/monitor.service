@@ -1,0 +1,34 @@
+# =============================================================================
+# monitor.service — systemd service unit for xnft-monitor
+# =============================================================================
+# Use alongside monitor.timer for a systemd-managed cron alternative.
+#
+# Install:
+#   sudo cp monitor.service /etc/systemd/system/xnft-monitor.service
+#   sudo cp monitor.timer  /etc/systemd/system/xnft-monitor.timer
+#   sudo systemctl daemon-reload
+#   sudo systemctl enable --now xnft-monitor.timer
+#
+# Check last run:
+#   journalctl -u xnft-monitor.service -n 50
+# =============================================================================
+
+[Unit]
+Description=xnftables security monitor
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+User=root
+WorkingDirectory=/opt/xnftables
+ExecStart=/opt/xnftables/scripts/monitor/xnft-monitor.sh
+StandardOutput=journal
+StandardError=journal
+SyslogIdentifier=xnft-monitor
+
+# Harden the service itself
+ProtectSystem=strict
+ProtectHome=true
+NoNewPrivileges=true
+ReadWritePaths=/tmp /opt/xnftables/scripts/monitor

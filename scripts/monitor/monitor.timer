@@ -1,0 +1,17 @@
+# =============================================================================
+# monitor.timer — systemd timer for xnft-monitor (weekdays at 08:00 local)
+# =============================================================================
+
+[Unit]
+Description=Run xnftables security monitor on weekday mornings
+Requires=xnft-monitor.service
+
+[Timer]
+# Monday–Friday at 08:00 local time
+OnCalendar=Mon..Fri 08:00:00
+# If the system was off at 08:00, run within 15 minutes of next boot
+Persistent=true
+RandomizedDelaySec=300
+
+[Install]
+WantedBy=timers.target
