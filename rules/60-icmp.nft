@@ -1,17 +1,26 @@
 # =============================================================================
-# 60-icmp.nft — Controlled ICMP / ICMPv6 policy
+# 60-icmp.nft — Controlled ICMP / ICMPv6 policy (PUBLIC interface)
 # =============================================================================
 # Blanket ICMP drops break things silently:
 #   - Path MTU Discovery (PMTUD) fails → TCP connections silently stall
 #   - Traceroute stops working → network debugging becomes impossible
 #   - Some TCP stacks hang waiting for ICMP unreachable that never arrives
 #
-# Policy:
-#   - Echo-request (ping): mesh peers only, rate-limited
-#   - ICMP types required for PMTUD and routing: allowed, rate-limited
-#   - ICMPv6 Neighbour Discovery: allowed from link-local (required for IPv6)
+# SCOPE (changed in v3): this file governs the PUBLIC interface only.
+# Mesh (wg0) traffic never reaches these rules — it is jumped into mesh_input
+# by 20-mesh.nft and terminates there.  In v2 this file contained
+# "echo-request from mesh peers" rules that were therefore DEAD CODE, and
+# mesh peers could not ping the server at all (BUG v3-03).  Mesh ICMP now
+# lives in mesh_input (20-mesh.nft).  The mesh-scoped rules that used to sit
+# here were doubly dead: on the public interface, packets sourced from
+# 10.10.0.0/24 are dropped earlier by the bogon filter (10.0.0.0/8 ∈ BOGON_V4).
+#
+# Policy (public interface):
+#   - Echo-request (ping): silently dropped — never confirm host existence
+#   - ICMP types required for PMTUD and traceroute: allowed, rate-limited
+#   - ICMPv6 Neighbour Discovery: allowed WITH hop-limit 255 guard
 #   - ICMPv6 nd-redirect: DROPPED (BUG 4B fix — IPv6 MITM vector)
-#   - Everything else: log and drop
+#   - Everything else: log (rate-limited) and drop
 #
 # BUG FIX (4B) — nd-redirect dropped:
 #   ICMPv6 Redirect (type 137) tells the host to change its first-hop router.
@@ -20,15 +29,22 @@
 #   RFC 4861 §8.1 requires redirects come from the current first-hop router.
 #   On a WireGuard mesh there is no legitimate use for redirects — removed.
 #
-# IMPROVEMENT (4C) — echo-reply removed from explicit rules:
-#   The original ruleset had an explicit "echo-reply ct state established accept"
-#   rule.  This is redundant — echo-reply for our own pings is already matched
-#   by "ct state established accept" in mesh_input (20-mesh.nft) and
-#   30-established.nft.  The duplicate rule has been removed.
+# BUG FIX (v3-05) — "ip6 nexthdr icmpv6" replaced with "meta l4proto icmpv6":
+#   nexthdr matches only the FIRST header after the fixed IPv6 header.  A
+#   packet with any extension header (hop-by-hop, fragment, routing…) before
+#   the ICMPv6 header did not match "ip6 nexthdr icmpv6" — it skipped every
+#   rule in this file and fell to the catch-all.  For the ACCEPT rules that
+#   was fail-safe; for the NDP flow it broke IPv6 with extension headers, and
+#   for classification generally it made the rules trivially evadable.
+#   "meta l4proto" walks the extension-header chain to the real transport.
 #
-# GAP FIX (3C / 3E) — ICMP rate limiting:
-#   ICMP essential types and NDP messages are now rate-limited to prevent
-#   ICMP-based amplification and neighbour-cache exhaustion attacks.
+# GAP FIX (v3-10) — NDP hop-limit 255 guard:
+#   RFC 4861 §7.1 requires NDP messages to arrive with hop limit 255 — proof
+#   the packet was NOT forwarded by any router (a router would decrement it).
+#   Accepting NDP with hop limit <255 lets OFF-LINK attackers poison the
+#   neighbour cache or advertise rogue routers from anywhere on the internet.
+#   The guard is free; the only NDP it rejects is NDP that crossed a router,
+#   which is invalid by definition.
 #
 # GAP FIX (4A) — ICMP essential types restricted + rate-limited:
 #   destination-unreachable and time-exceeded are required from "everywhere"
@@ -37,6 +53,9 @@
 #     - Connection kill: forge type 3 code 1 to terminate a TCP session
 #   We rate-limit these to 10/second and log drops.  The PMTUD risk is
 #   partially mitigated by TCP MSS clamping at the WireGuard level.
+#
+# LOGGING: every log rule is rate-limited and SPLIT from its drop rule so the
+# log limit can never gate the drop (see 10-antiscan.nft header).
 #
 # ICMP types reference (IPv4):
 #   0  echo-reply                — ping reply
@@ -61,43 +80,40 @@ table inet filter {
     chain input {
 
         # =====================================================================
-        # IPv4 ICMP
+        # IPv4 ICMP (public interface — mesh ICMP lives in 20-mesh.nft)
         # =====================================================================
 
-        # Ping from mesh peers only — useful for connectivity diagnostics.
-        # Rate-limited: 10/second per the entire input chain (not per-source).
-        # For per-peer ping rate limiting, use a meter here.
-        ip protocol icmp \
-            icmp type echo-request \
-            ip saddr @MESH_PEERS \
-            limit rate 10/second \
-            accept comment "icmp4: echo-request from mesh peers"
-
-        # Silently drop ping from public internet — we don't want to confirm
-        # host existence to internet scanners.
-        ip protocol icmp \
-            icmp type echo-request \
-            drop comment "icmp4: drop echo-request from public internet"
+        # Silently drop ping from the public internet — we don't want to
+        # confirm host existence to internet scanners.  No log: this is the
+        # single most common background-noise packet on the internet and
+        # logging it would drown everything else (the catch-all in
+        # 70-logging.nft is rate-limited for the same reason).
+        icmp type echo-request \
+            counter drop comment "icmp4: drop echo-request from public internet"
 
         # Essential ICMP types required for PMTUD and traceroute.
         # Accepted from any source (required for PMTUD to work end-to-end)
         # but rate-limited to mitigate PMTUD blackhole injection and TCP
         # connection-kill attacks (GAP 4A fix).
-        ip protocol icmp \
-            icmp type { destination-unreachable, time-exceeded } \
+        icmp type { destination-unreachable, time-exceeded } \
             limit rate 10/second burst 20 packets \
             accept comment "icmp4: PMTUD + traceroute (rate-limited)"
 
-        # Log + drop excessive essential ICMP (possible flood/injection attempt).
-        ip protocol icmp \
-            icmp type { destination-unreachable, time-exceeded } \
+        # Log + drop excessive essential ICMP (possible flood/injection).
+        icmp type { destination-unreachable, time-exceeded } \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-ICMP4-EXCESS: " level info \
-            drop comment "icmp4: PMTUD rate-limit exceeded"
+            comment "icmp4: log PMTUD rate-limit excess (rate-limited)"
+        icmp type { destination-unreachable, time-exceeded } \
+            counter drop comment "icmp4: PMTUD rate-limit exceeded"
 
         # Drop all other ICMP.
-        ip protocol icmp \
+        meta l4proto icmp \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-ICMP4-DROP: " level info \
-            drop comment "icmp4: drop unmatched"
+            comment "icmp4: log unmatched ICMP (rate-limited)"
+        meta l4proto icmp \
+            counter drop comment "icmp4: drop unmatched"
 
         # =====================================================================
         # IPv6 ICMP (ICMPv6)
@@ -108,55 +124,78 @@ table inet filter {
         # Types 133–136: Router Sol/Adv, Neighbour Sol/Adv.
         #
         # BUG FIX (4B): nd-redirect (type 137) is intentionally EXCLUDED.
-        # It is a MITM vector and has no legitimate use in this topology.
-        #
+        # GAP FIX (v3-10): hop limit MUST be 255 (RFC 4861 §7.1) — anything
+        # lower was forwarded by a router and is therefore off-link forgery.
         # Rate-limited to prevent neighbour-cache exhaustion (GAP 3E fix).
-        ip6 nexthdr icmpv6 \
+        meta l4proto icmpv6 \
             icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } \
+            ip6 hoplimit 255 \
             limit rate 50/second burst 100 packets \
-            accept comment "icmp6: NDP (nd-redirect excluded, rate-limited)"
+            accept comment "icmp6: NDP (hoplimit-255 guard, nd-redirect excluded)"
 
-        # Log excessive NDP — could indicate a neighbour-cache exhaustion attack.
-        ip6 nexthdr icmpv6 \
+        # NDP with hop limit != 255 is off-link forgery — log loudly.
+        meta l4proto icmpv6 \
             icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } \
+            ip6 hoplimit != 255 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-NDP-OFFLINK: " level warn \
+            comment "icmp6: log off-link NDP forgery (rate-limited)"
+        meta l4proto icmpv6 \
+            icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } \
+            ip6 hoplimit != 255 \
+            counter drop comment "icmp6: drop off-link NDP (RFC 4861 §7.1)"
+
+        # Log + drop excessive on-link NDP — neighbour-cache exhaustion.
+        meta l4proto icmpv6 \
+            icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-NDP-EXCESS: " level info \
-            drop comment "icmp6: NDP rate-limit exceeded"
+            comment "icmp6: log NDP rate-limit excess (rate-limited)"
+        meta l4proto icmpv6 \
+            icmpv6 type { nd-router-solicit, nd-router-advert, nd-neighbor-solicit, nd-neighbor-advert } \
+            counter drop comment "icmp6: NDP rate-limit exceeded"
 
         # Explicit DROP for nd-redirect (BUG 4B).
         # Belt-and-suspenders: even if the allow rule above were modified to
         # include type 137, this catch below ensures it is always dropped.
-        ip6 nexthdr icmpv6 \
+        meta l4proto icmpv6 \
             icmpv6 type nd-redirect \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-ICMP6-REDIRECT: " level warn \
-            drop comment "icmp6: nd-redirect dropped (MITM vector, BUG 4B)"
+            comment "icmp6: log nd-redirect (rate-limited)"
+        meta l4proto icmpv6 \
+            icmpv6 type nd-redirect \
+            counter drop comment "icmp6: nd-redirect dropped (MITM vector, BUG 4B)"
 
         # Essential ICMPv6 types (PMTUD, traceroute) — same rationale as v4.
         # packet-too-big (type 2) is IPv6's equivalent of frag-needed.
-        ip6 nexthdr icmpv6 \
+        # NOTE: unlike IPv4, PMTUD is MANDATORY in IPv6 (routers never
+        # fragment) — blocking packet-too-big breaks IPv6 TCP outright.
+        meta l4proto icmpv6 \
             icmpv6 type { destination-unreachable, time-exceeded, packet-too-big } \
             limit rate 10/second burst 20 packets \
             accept comment "icmp6: PMTUD + traceroute (rate-limited)"
 
-        ip6 nexthdr icmpv6 \
+        meta l4proto icmpv6 \
             icmpv6 type { destination-unreachable, time-exceeded, packet-too-big } \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-ICMP6-EXCESS: " level info \
-            drop comment "icmp6: PMTUD rate-limit exceeded"
+            comment "icmp6: log PMTUD rate-limit excess (rate-limited)"
+        meta l4proto icmpv6 \
+            icmpv6 type { destination-unreachable, time-exceeded, packet-too-big } \
+            counter drop comment "icmp6: PMTUD rate-limit exceeded"
 
-        # Ping from mesh peers (IPv6).
-        # Only active if MESH_PEERS6 is populated in 00-tables.nft.
-        ip6 nexthdr icmpv6 \
+        # Silently drop ping from the public internet (same stance as v4).
+        meta l4proto icmpv6 \
             icmpv6 type echo-request \
-            ip6 saddr @MESH_PEERS6 \
-            limit rate 10/second \
-            accept comment "icmp6: echo-request from mesh peers"
-
-        ip6 nexthdr icmpv6 \
-            icmpv6 type echo-request \
-            drop comment "icmp6: drop echo-request from public internet"
+            counter drop comment "icmp6: drop echo-request from public internet"
 
         # Drop all other ICMPv6.
-        ip6 nexthdr icmpv6 \
+        meta l4proto icmpv6 \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-ICMP6-DROP: " level info \
-            drop comment "icmp6: drop unmatched"
+            comment "icmp6: log unmatched ICMPv6 (rate-limited)"
+        meta l4proto icmpv6 \
+            counter drop comment "icmp6: drop unmatched"
     }
 }

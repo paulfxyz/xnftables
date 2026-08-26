@@ -22,20 +22,10 @@ PASS=0
 FAIL=0
 ERRORS=()
 
-check_file() {
-    local file="$1"
-    # nft -c on individual include files may fail due to missing table context.
-    # We run against the full nftables.conf for the authoritative check.
-    # Per-file checks catch obvious syntax errors early.
-    if nft -c -f "$file" 2>/dev/null; then
-        echo "  OK  $file"
-        ((PASS++)) || true
-    else
-        echo "  FAIL $file"
-        ERRORS+=("$file")
-        ((FAIL++)) || true
-    fi
-}
+# Note: individual rule files are NOT checked in isolation — they are include
+# fragments that reference sets/chains defined in 00-tables.nft, so nft -c on
+# a single file always fails with missing-context errors. The full-ruleset
+# dry-run below is the only meaningful syntax check.
 
 echo "==> xnftables syntax check"
 echo ""
@@ -44,32 +34,32 @@ echo ""
 # Requires running as root (nft -c touches kernel interfaces).
 CONF="$(dirname "$0")/../nftables.conf"
 if [[ -f "$CONF" ]]; then
-    if [[ $EUID -eq 0 ]]; then
-        echo "--- Full ruleset (nftables.conf) ---"
-        if nft -c -f "$CONF"; then
-            echo "  OK  nftables.conf (full ruleset)"
-            ((PASS++)) || true
-        else
-            echo "  FAIL nftables.conf (full ruleset)"
-            ERRORS+=("nftables.conf")
-            ((FAIL++)) || true
-        fi
+  if [[ $EUID -eq 0 ]]; then
+    echo "--- Full ruleset (nftables.conf) ---"
+    if nft -c -f "$CONF"; then
+      echo "  OK  nftables.conf (full ruleset)"
+      ((PASS++)) || true
     else
-        echo "--- Skipping full ruleset check (requires root) ---"
-        echo "    Run: sudo ./scripts/check.sh for complete validation"
+      echo "  FAIL nftables.conf (full ruleset)"
+      ERRORS+=("nftables.conf")
+      ((FAIL++)) || true
     fi
+  else
+    echo "--- Skipping full ruleset check (requires root) ---"
+    echo "    Run: sudo ./scripts/check.sh for complete validation"
+  fi
 fi
 
 echo ""
 echo "==> Results: ${PASS} passed, ${FAIL} failed"
 
 if [[ ${#ERRORS[@]} -gt 0 ]]; then
-    echo ""
-    echo "Files with errors:"
-    for f in "${ERRORS[@]}"; do
-        echo "  - $f"
-    done
-    exit 1
+  echo ""
+  echo "Files with errors:"
+  for f in "${ERRORS[@]}"; do
+    echo "  - $f"
+  done
+  exit 1
 fi
 
 exit 0

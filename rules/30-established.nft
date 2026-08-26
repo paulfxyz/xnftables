@@ -23,7 +23,7 @@
 #   Under a SYN flood or UDP flood, the conntrack table can fill, causing
 #   ct state established to stop matching — all active connections drop.
 #   Mitigations:
-#     a) SYN flood guard in 05-antiscan.nft (per-source rate limit)
+#     a) SYN flood guard in 10-antiscan.nft (per-source rate limit)
 #     b) Tune the conntrack table size in /etc/sysctl.d/:
 #          net.netfilter.nf_conntrack_max = 262144
 #          net.netfilter.nf_conntrack_tcp_timeout_established = 86400

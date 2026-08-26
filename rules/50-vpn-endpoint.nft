@@ -27,15 +27,33 @@
 #   exhausts the entire budget, blocking ALL other peers from completing
 #   handshakes.  Effective denial-of-service against the WireGuard endpoint.
 #
-#   Fix: use a "meter" which creates an independent token bucket per source IP:
-#     meter wg_rl { ip saddr timeout 60s limit rate 5/minute }
-#   Now each peer has its own 5/minute budget.  An attacker only blocks
-#   themselves.  Legitimate peers are unaffected.
+#   Fix: use a "meter" which creates an independent token bucket per source IP.
+#   Now each peer has its own budget.  An attacker only blocks themselves.
+#
+# BUG FIX (v3-04) — inverted meter logic, IPv6 lockout, unbounded memory:
+#   The v2 meter matched sources WITHIN the limit and accepted them; anything
+#   else fell to an unconditional drop.  Three failure modes:
+#     1. IPv6 handshakes: the meter keyed on "ip saddr" (IPv4-only match), so
+#        every IPv6 handshake missed the accept and hit the drop — WireGuard
+#        over IPv6 was silently impossible.
+#     2. No "size" cap: meter memory was unbounded (kernel default 65535
+#        anyway, but implicit limits are how you get surprised at 3am).
+#     3. Fail-CLOSED: when the meter table filled, NEW sources could not be
+#        tracked, never matched the accept, and were dropped — an attacker
+#        who fills the meter locks every new peer out of the VPN.
+#   v3 inverts the logic: the meter matches sources EXCEEDING the limit and
+#   drops them; everything else falls through to a plain accept.  A full
+#   meter now degrades to "no rate limiting" (fail-OPEN) — acceptable here
+#   because WireGuard itself authenticates cryptographically and silently
+#   discards anything that doesn't decrypt.  The rate limit is noise
+#   reduction, not the security boundary; it must never become the outage.
 #
 # Rate-limit rationale:
 #   WireGuard rekeys every ~3 minutes by default (REKEY_AFTER_TIME = 180s).
-#   5 handshakes/minute per source is generous for legitimate peers and still
-#   leaves headroom for reconnects after roaming or network changes.
+#   10 handshake datagrams/minute per source is generous for legitimate peers
+#   and still leaves headroom for reconnects after roaming or network changes.
+#   (v2 used 5/minute, which flirted with dropping legitimate retries —
+#   handshake initiations retransmit every ~5s until answered.)
 #
 # Change the port if your WireGuard server uses a non-default listen port.
 # Must match ListenPort in /etc/wireguard/wg0.conf.
@@ -44,18 +62,31 @@
 table inet filter {
     chain input {
 
-        # Per-source rate limit (BUG 3A fix).
-        # Each source IP gets its own independent token bucket: 5/minute.
-        # The meter entry expires after 60s of inactivity to bound memory use.
+        # Per-source over-limit drop (IPv4).  Sources exceeding the budget
+        # jump to a rate-limited log + drop; everyone else falls through.
         udp dport 51820 \
-            meter wg_handshake_rl { ip saddr timeout 60s limit rate 5/minute } \
-            accept comment "vpn-endpoint: WireGuard handshake per-source rate-limit"
+            meter wg_handshake_rl size 65535 { ip saddr timeout 60s limit rate over 10/minute } \
+            jump wg_ratelimit_drop comment "vpn-endpoint: WG handshake per-source limit (IPv4)"
 
-        # Log and drop: either rate exceeded or IPv6 source (no v6 meter yet).
-        # Seeing this log line from a single source IP repeatedly indicates
-        # a scan or handshake flood — worth investigating.
+        # Per-source over-limit drop (IPv6), keyed per /64 — a single attacker
+        # typically controls an entire /64, so per-address metering would let
+        # them rotate through 2^64 fresh buckets (BUG v3-04.1).
         udp dport 51820 \
+            meter wg_handshake_rl6 size 65535 { ip6 saddr and ffff:ffff:ffff:ffff:: timeout 60s limit rate over 10/minute } \
+            jump wg_ratelimit_drop comment "vpn-endpoint: WG handshake per-/64 limit (IPv6)"
+
+        # The ONLY public accept in the entire ruleset.
+        udp dport 51820 \
+            counter accept comment "vpn-endpoint: WireGuard handshake (public, v4+v6)"
+    }
+
+    # Rate-limited log + unconditional drop for handshake-flood offenders.
+    # Seeing this prefix repeatedly from one source indicates a scan or
+    # handshake flood — worth investigating.
+    chain wg_ratelimit_drop {
+        limit rate 10/second burst 20 packets \
             log prefix "XNFT-WG-RATELIMIT: " level info \
-            drop comment "vpn-endpoint: WireGuard handshake rate-limit exceeded"
+            comment "vpn-endpoint: log handshake flood (rate-limited)"
+        counter drop comment "vpn-endpoint: handshake rate-limit exceeded, drop"
     }
 }

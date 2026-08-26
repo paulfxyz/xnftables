@@ -39,17 +39,26 @@ table inet filter {
         # -----------------------------------------------------------------------
         # SSH — remote shell (mesh peers only)
         # -----------------------------------------------------------------------
-        # Rate-limited: 6 new connections/minute per source prevents automated
+        # Rate-limited: 6 new connections/minute PER SOURCE prevents automated
         # brute-force even from a mesh peer (e.g. a compromised node).
+        #
+        # BUG FIX (v3-09): v2 used a plain "limit rate 6/minute" — a GLOBAL
+        # token bucket shared by every peer.  One noisy peer (or a stuck
+        # reconnect loop) exhausted the budget and locked every other peer
+        # out of SSH.  A meter gives each source IP its own bucket; only the
+        # offender is limited.  size 65535 bounds meter memory; if the meter
+        # ever fills, the over-limit rule stops matching and SSH stays
+        # reachable (fail-open at the rate-limit layer — sshd auth remains).
+        #
         # Change to port 2222 (or any other port) if preferred — but mesh-only
         # access is already a strong enough deterrent that obscurity adds little.
         tcp dport 22 ct state new \
-            limit rate 6/minute \
-            accept comment "service: SSH new conn rate-limit (mesh-only)"
+            meter ssh_rl size 65535 { ip saddr timeout 60s limit rate over 6/minute } \
+            jump ssh_ratelimit_drop comment "service: SSH per-source rate-limit (IPv4)"
 
         tcp dport 22 ct state new \
-            log prefix "XNFT-SSH-RATELIMIT: " level info \
-            drop comment "service: SSH rate-limit exceeded"
+            meter ssh_rl6 size 65535 { ip6 saddr timeout 60s limit rate over 6/minute } \
+            jump ssh_ratelimit_drop comment "service: SSH per-source rate-limit (IPv6)"
 
         tcp dport 22 accept comment "service: SSH (mesh-only)"
 
@@ -113,8 +122,19 @@ table inet filter {
         # udp dport <PORT> accept comment "service: <NAME> — <WHY> (mesh-only)"
 
         # -----------------------------------------------------------------------
-        # Catch-all: un-matched mesh traffic falls through to 70-logging.nft.
-        # Do NOT add a drop here — let logging fire first.
+        # Catch-all: un-matched mesh traffic returns to mesh_input, where the
+        # final XNFT-MESH-DENY log + drop fires (20-mesh.nft).
+        # Do NOT add a drop here — let that labelled deny fire instead.
         # -----------------------------------------------------------------------
+    }
+
+    # Rate-limited log + unconditional drop for SSH rate-limit offenders.
+    # Separate chain so the log's own rate limit can never gate the drop
+    # (see 10-antiscan.nft header for the pattern rationale).
+    chain ssh_ratelimit_drop {
+        limit rate 6/minute burst 10 packets \
+            log prefix "XNFT-SSH-RATELIMIT: " level info \
+            comment "service: log SSH rate-limit excess (rate-limited)"
+        counter drop comment "service: SSH rate-limit exceeded, drop"
     }
 }

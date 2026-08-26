@@ -11,10 +11,24 @@
 #
 # Check last run:
 #   journalctl -u xnft-monitor.service -n 50
+#
+# Verify the sandbox after any edit:
+#   systemd-analyze security xnft-monitor.service
+#
+# THREAT MODEL
+# ------------
+# This unit runs a bash script that fetches and parses untrusted HTML/JSON from
+# five internet sources.  It still runs as root (so it can be dropped into an
+# existing root-owned /opt deployment), but everything root normally *could* do
+# is taken away: no capabilities, no writable filesystem except its own state
+# directory, no new privileges, no kernel tunables, no non-IP sockets, no
+# W+X memory, and a system-service syscall allowlist.  A parser bug in the
+# script therefore yields a uid-0 process that can do almost nothing.
 # =============================================================================
 
 [Unit]
 Description=xnftables security monitor
+Documentation=file:/opt/xnftables/scripts/monitor/README.md
 After=network-online.target
 Wants=network-online.target
 
@@ -22,13 +36,73 @@ Wants=network-online.target
 Type=oneshot
 User=root
 WorkingDirectory=/opt/xnftables
-ExecStart=/opt/xnftables/scripts/monitor/xnft-monitor.sh
+
+# State lives in /var/lib/xnft-monitor (created 0700 by StateDirectory=), never
+# in /tmp: a root process opening a predictable /tmp path by name is a symlink
+# attack waiting to happen.  XNFT_STATE_DIR tells the script to use it for both
+# the findings JSON and .last-seen-versions.
+StateDirectory=xnft-monitor
+StateDirectoryMode=0700
+Environment=XNFT_STATE_DIR=/var/lib/xnft-monitor
+
+# Secrets: prefer a root-owned 0600 KEY=VALUE file parsed by systemd (never
+# executed as shell) over the script's own .env sourcing.  The leading "-"
+# makes it optional.
+EnvironmentFile=-/etc/xnft-monitor.env
+
+ExecStart=/opt/xnftables/scripts/monitor/xnft-monitor.sh --notify all
+
+# A hung upstream must not leave the job in "activating" forever, which would
+# silently skip every later timer trigger.
+TimeoutStartSec=300
+
+# Findings files and state are secrets-adjacent: keep them owner-only.
+UMask=0077
+
 StandardOutput=journal
 StandardError=journal
 SyslogIdentifier=xnft-monitor
 
-# Harden the service itself
+# --- Sandbox ----------------------------------------------------------------
+# Privilege escalation
+NoNewPrivileges=yes
+# Drop every capability, including the ones root would otherwise hold.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+# Filesystem: whole tree read-only, /home invisible, private /tmp so no shared
+# /tmp namespace exists to attack.  StateDirectory= is writable automatically;
+# ReadWritePaths is listed explicitly for clarity and for deployments that
+# override XNFT_STATE_DIR.  The code directory (/opt/xnftables) is deliberately
+# NOT writable — a service that can rewrite its own script or .env is a
+# persistence mechanism.
 ProtectSystem=strict
-ProtectHome=true
-NoNewPrivileges=true
-ReadWritePaths=/tmp /opt/xnftables/scripts/monitor
+ProtectHome=yes
+PrivateTmp=yes
+PrivateDevices=yes
+ReadWritePaths=/var/lib/xnft-monitor
+
+# Kernel and host surface
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+ProtectProc=invisible
+ProcSubset=pid
+RestrictNamespaces=yes
+RestrictSUIDSGID=yes
+RestrictRealtime=yes
+LockPersonality=yes
+KeyringMode=private
+
+# Networking: outbound HTTPS only needs IP sockets; AF_UNIX stays for the
+# journal and resolver sockets.
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+
+# Memory and syscalls
+MemoryDenyWriteExecute=yes
+SystemCallArchitectures=native
+SystemCallFilter=@system-service
+SystemCallErrorNumber=EPERM

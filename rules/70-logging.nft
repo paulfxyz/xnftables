@@ -15,11 +15,17 @@
 #   events while staying sane under a sustained flood.  Packets above the log
 #   rate are still dropped silently by the second rule.
 #
-# BUG FIX (9A) — forward chain conntrack:
-#   The original forward chain had no conntrack accept rule.  Policy drop +
-#   log+drop means ALL forwarded traffic was dropped, including established
-#   connections through a WireGuard hub router.
-#   Fixed: conntrack accept is added to forward before the log+drop catch-all.
+# BUG FIX (9A, completed in v3) — forward chain conntrack:
+#   The original forward chain had no conntrack accept rule.  v2 added an
+#   established/related accept and claimed hub routing was fixed — but that
+#   claim was FALSE (BUG v3-11): with no rule accepting NEW forwarded
+#   connections, nothing could ever BECOME established.  The accept was
+#   unreachable dead code and all forwarding remained broken.
+#   v3 documents this honestly: forwarding is OFF by design on a leaf node.
+#   If this host is a mesh HUB (peers reach each other through it), you must
+#   uncomment the mesh-to-mesh NEW accept template in the forward chain below
+#   AND set net.ipv4.ip_forward=1.  Leaf nodes should leave it commented —
+#   deny-by-default applies to forwarding too.
 #
 # Where do the logs go?
 #   Kernel netfilter logs go via printk, appearing in:
@@ -52,6 +58,18 @@ table inet filter {
 
         ct state { established, related } \
             accept comment "forward: established/related (hub routing)"
+
+        # --- HUB ROUTING TEMPLATE (BUG v3-11) — uncomment on hub nodes only ---
+        # Without a NEW accept, the established/related rule above is dead
+        # code: no forwarded connection can ever reach established state.
+        # This is CORRECT for leaf nodes (deny-by-default).  On a hub:
+        #   1. Uncomment the rule below
+        #   2. sysctl -w net.ipv4.ip_forward=1  (persist in /etc/sysctl.d/)
+        #   3. Reload and test peer-to-peer reachability through the hub
+        # iifname "wg0" oifname "wg0" \
+        #     ip saddr @MESH_PEERS ip daddr @MESH_PEERS \
+        #     ct state new \
+        #     accept comment "forward: mesh-to-mesh hub routing (new conns)"
 
         # Log forwarding attempts that don't match any established session.
         limit rate 10/second burst 20 packets \

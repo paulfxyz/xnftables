@@ -17,8 +17,8 @@
 # service (DNS, NTP, package managers, WireGuard, etc.).
 #
 # Sub-chains (populated by subsequent includes, in order):
-#   05-antiscan    → bogon/martian filtering, TCP scan drops, SYN flood guard
-#   10-loopback    → unconditional loopback accept
+#   10-antiscan    → bogon/martian filtering, TCP scan drops, SYN flood guard
+#   05-loopback    → unconditional loopback accept
 #   20-mesh        → WireGuard wg0 trust boundary
 #   30-established → conntrack fast-path
 #   40-services    → per-service allowlist (mesh peers only)
@@ -101,8 +101,37 @@ table inet filter {
             198.51.100.0/24,    # TEST-NET-2 documentation (RFC5737)
             203.0.113.0/24,     # TEST-NET-3 documentation (RFC5737)
             224.0.0.0/4,        # multicast
-            240.0.0.0/4,        # reserved / class E
-            255.255.255.255/32  # broadcast
+            240.0.0.0/4         # reserved / class E — includes 255.255.255.255
+            # NOTE: 255.255.255.255/32 (limited broadcast) is intentionally NOT
+            # listed: it is already contained in 240.0.0.0/4, and nftables
+            # rejects overlapping intervals in a non-auto-merge interval set
+            # ("Error: conflicting intervals specified" on nft >= 1.1).
+        }
+    }
+
+    # IPv6 bogon/martian sources — addresses that must never appear as the
+    # source of a packet arriving on a public interface.
+    #
+    # DELIBERATELY ABSENT:
+    #   fe80::/10 — link-local is REQUIRED as a source for NDP (neighbor/router
+    #               discovery). Blocking it breaks IPv6 entirely.
+    #   fc00::/7  — ULA space. Bogon on the open internet, but commonly used
+    #               inside WireGuard meshes for IPv6 peers. wg0 is exempt from
+    #               bogon filtering anyway; add it here ONLY if you are certain
+    #               no upstream legitimately sources ULA toward this host.
+    set BOGON_V6 {
+        type ipv6_addr
+        flags interval
+        elements = {
+            ::/128,              # unspecified
+            ::1/128,             # loopback — must not arrive on non-lo iface
+            ::ffff:0:0/96,       # IPv4-mapped (RFC4291) — never valid on wire
+            64:ff9b::/96,        # NAT64 well-known prefix (RFC6052) as source
+            100::/64,            # discard-only (RFC6666)
+            2001:db8::/32,       # documentation (RFC3849)
+            2001:10::/28,        # ORCHID (deprecated, RFC4843)
+            3ffe::/16,           # 6bone (decommissioned, RFC3701)
+            ff00::/8             # multicast — invalid as source
         }
     }
 

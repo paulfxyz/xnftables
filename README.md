@@ -4,7 +4,8 @@
 [![nftables](https://img.shields.io/badge/nftables-%E2%89%A50.9.3-orange?logo=linux&logoColor=white)](https://wiki.nftables.org/)
 [![WireGuard](https://img.shields.io/badge/WireGuard-mesh--or--nothing-88171A?logo=wireguard&logoColor=white)](https://www.wireguard.com/)
 [![Kernel](https://img.shields.io/badge/Linux%20kernel-%E2%89%A55.6-informational?logo=linux&logoColor=white)](https://www.kernel.org/)
-[![CI](https://img.shields.io/github/actions/workflow/status/paulfxyz/xnftables/validate.yml?label=nft%20syntax)](https://github.com/paulfxyz/xnftables/actions)
+[![CI](https://img.shields.io/github/actions/workflow/status/paulfxyz/xnftables/validate.yml?label=CI%20%2B%20SAST)](https://github.com/paulfxyz/xnftables/actions)
+[![Tests](https://img.shields.io/badge/enforcement%20tests-29%20TAP-blue)](./tests)
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/paulfxyz/xnftables/pulls)
 [![Deny All](https://img.shields.io/badge/default%20policy-DROP-critical)](https://github.com/paulfxyz/xnftables)
 
@@ -29,8 +30,11 @@
 - [Adding and removing services](#adding-a-service)
 - [Reading the logs](#reading-the-logs)
 - [Auditing the ruleset](#auditing-the-ruleset)
+- [Testing the ruleset](#testing-the-ruleset)
+- [Deploying to production](#deploying-to-production)
 - [Security model](#security-model)
 - [Known bugs fixed in v2](#known-bugs-fixed-in-v2)
+- [Known bugs fixed in v3](#known-bugs-fixed-in-v3-the-5-model-audit)
 - [nftables primer](#nftables-primer)
 - [Why nftables over iptables](#why-nftables-over-iptables)
 - [Why WireGuard over OpenVPN / IPsec](#why-wireguard-over-openvpn--ipsec)
@@ -40,7 +44,7 @@
 - [Security monitoring](#security-monitoring)
 - [Advanced patterns](#advanced-patterns)
 - [Hardening checklist](#hardening-checklist)
-- [Tested on](#tested-on)
+- [Compatibility](#compatibility)
 - [References](#references)
 
 ---
@@ -95,23 +99,27 @@ Changes are committed to git with a message explaining *why* a service was added
 ```
 nftables.conf                    ← entry point (scoped flush + includes)
 rules/
-  00-tables.nft                  ← table, chains, named sets (MESH_PEERS, BOGON_V4…)
-  05-antiscan.nft                ← bogons, TCP flag abuse, SYN flood, fragments
-  10-loopback.nft                ← loopback unconditional accept
-  20-mesh.nft                    ← WireGuard trust boundary + break-glass
+  00-tables.nft                  ← table, chains, named sets (MESH_PEERS, BOGON_V4/V6…)
+  05-loopback.nft                ← loopback unconditional accept (MUST be first)
+  10-antiscan.nft                ← bogons, TCP flag abuse, SYN flood, fragments
+  20-mesh.nft                    ← WireGuard trust boundary + break-glass + mesh ICMP
   30-established.nft             ← conntrack fast-path (public iface)
   40-services.nft                ← per-service allowlist (mesh peers only)
   50-vpn-endpoint.nft            ← WireGuard UDP port (per-source rate-limited)
-  60-icmp.nft                    ← controlled ICMP/ICMPv6
+  60-icmp.nft                    ← controlled ICMP/ICMPv6 (public iface)
   70-logging.nft                 ← catch-all log+drop (must stay last)
 scripts/
-  reload.sh                      ← safe reload with dry-run + auto-rollback
+  reload.sh                      ← safe reload with dry-run + confirm-or-revert
   check.sh                       ← syntax validator (pre-commit / CI)
+  monitor/                       ← CVE / release monitor (see MONITOR.md)
+tests/                           ← enforcement test suite — 29 TAP tests (see tests/README.md)
+DEPLOYMENT.md                    ← production deployment checklist (phases 0–7)
+MONITOR.md                       ← security monitoring guide
 .github/
-  workflows/validate.yml         ← GitHub Actions CI pipeline
+  workflows/validate.yml         ← CI: syntax, enforcement tests, SAST, secret scan
 ```
 
-The include order matters. `05-antiscan` drops impossible packets first. Loopback and conntrack come before service rules. Logging is always last.
+The include order matters. Loopback is accepted first (127.0.0.0/8 is in `BOGON_V4`, so antiscan would otherwise kill it — that was BUG v3-02). `10-antiscan` then drops impossible packets before any trust decisions. Logging is always last.
 
 ---
 
@@ -121,32 +129,34 @@ The include order matters. `05-antiscan` drops impossible packets first. Loopbac
 Incoming packet
       │
       ▼
-[05-antiscan]
-  bogon source?          ──────────────────────────────► LOG + DROP
-  TCP NULL/XMAS/SYN+FIN? ──────────────────────────────► LOG + DROP
-  SYN flood per-source?  ──────────────────────────────► LOG + DROP
-  IP fragment (public)?  ──────────────────────────────► LOG + DROP
+[05-loopback]
+  iifname == "lo"        ──────────────────────────────► ACCEPT
       │
       ▼
-[10-loopback]
-  iifname == "lo"        ──────────────────────────────► ACCEPT
+[10-antiscan]
+  bogon source (v4/v6)?  ──────────────────────────────► LOG + DROP
+  TCP NULL/XMAS/SYN+FIN? ──────────────────────────────► LOG + DROP
+  SYN flood (over 30/s per source)? ───────────────────► LOG + DROP (under limit: continue)
+  IP fragment (public)?  ──────────────────────────────► LOG + DROP
       │
       ▼
 [20-mesh]
   ADMIN_ALLOWLIST + tcp/22 (break-glass, pre-wg0) ─────► ACCEPT (rate-limited)
-  wg0 + saddr ∉ MESH_PEERS ────────────────────────────► LOG + DROP (spoof)
+  wg0 + saddr ∉ MESH_PEERS (v4/v6) ────────────────────► LOG + DROP (spoof)
   wg0                    ──────────────────────────────► jump mesh_input
                                   │
                            mesh_input:
                            ct invalid ───────────────────► LOG + DROP
                            ct established ──────────────► ACCEPT (fast-path)
+                           icmp echo ∈ MESH_PEERS ──────► ACCEPT (mesh ping, rate-limited)
                            saddr ∈ MESH_PEERS ──────────► jump services
                                       │
                                services:
                                tcp/22  ─────────────────► ACCEPT (SSH, rate-limited)
                                tcp/443 ─────────────────► ACCEPT (if enabled)
                                …other explicit services…
-                               no match ────────────────► fall-through
+                               no match ────────────────► back to mesh_input
+                           anything left ───────────────► LOG + DROP (XNFT-MESH-DENY)
       │
       ▼
 [30-established]  (public iface only — mesh handled above)
@@ -155,15 +165,14 @@ Incoming packet
       │
       ▼
 [50-vpn-endpoint]
-  udp/51820, per-source rate OK  ──────────────────────► ACCEPT (WireGuard)
-  udp/51820, rate exceeded       ──────────────────────► LOG + DROP
+  udp/51820, over rate (per-source v4 / per-/64 v6) ────► LOG + DROP
+  udp/51820                      ──────────────────────► ACCEPT (WireGuard, v4+v6)
       │
       ▼
-[60-icmp]
-  echo-request from MESH_PEERS   ──────────────────────► ACCEPT (rate-limited)
-  echo-request from internet     ──────────────────────► DROP (stealth)
+[60-icmp]  (public iface — mesh ICMP handled in mesh_input)
+  echo-request from internet     ──────────────────────► DROP (stealth, silent)
   PMTUD/traceroute types         ──────────────────────► ACCEPT (rate-limited)
-  NDP (no nd-redirect)           ──────────────────────► ACCEPT (rate-limited)
+  NDP (hoplimit 255 only, no nd-redirect) ─────────────► ACCEPT (rate-limited)
   nd-redirect                    ──────────────────────► LOG + DROP (MITM vector)
   everything else                ──────────────────────► LOG + DROP
       │
@@ -245,7 +254,7 @@ cp scripts/check.sh .git/hooks/pre-commit
 chmod +x .git/hooks/pre-commit
 ```
 
-From now on, every `git commit` that touches `.nft` files will fail if syntax is invalid.
+The hook validates `.nft` syntax on every commit. Note: full validation (`nft -c` against the real include tree) requires root — without it the hook only performs lightweight structural checks and defers to CI, which runs the complete 9-job pipeline (syntax, enforcement tests, SAST, secret scan) on every push.
 
 ---
 
@@ -333,20 +342,22 @@ sudo ./scripts/reload.sh
 
 What it does:
 1. Runs `nft -c` (dry-run — validates without touching state)
-2. Saves a rollback dump of the current live ruleset
+2. Saves a rollback snapshot of the current live ruleset to `/run/xnftables` (mode 600, prefixed with `flush ruleset` so a restore **replaces** state instead of merging into it)
 3. Applies the new config
-4. If `nft -f` fails, auto-reverts to the saved dump
+4. If `nft -f` fails, auto-reverts to the snapshot
 
-### Remote-safe testing (auto-rollback)
+### Remote-safe testing (confirm-or-revert)
 
 When testing new rules on a remote server where a lockout would be catastrophic:
 
 ```bash
-# Apply rules, but auto-revert after 60 seconds unless you cancel
+# Apply rules, then type 'keep' + Enter within 60 seconds — or they revert
 sudo ./scripts/reload.sh --confirm-timeout 60
-# If the new rules work: kill the background revert job (script prints the PID)
-# If you get locked out: wait 60 seconds, rules revert automatically
+# If the new rules work: type keep ⏎ at the prompt
+# If you get locked out: the prompt never receives input → automatic revert
 ```
+
+The confirmation is a blocking read on the same SSH session — there is no background job to hunt down and kill. If your session dies because the new rules cut you off, the read times out and the snapshot is restored.
 
 ### Validate only (no apply)
 
@@ -383,11 +394,15 @@ All log lines are prefixed `XNFT-<CATEGORY>:` for easy filtering.
 | `XNFT-INVALID` | Conntrack invalid state (public iface) |
 | `XNFT-MESH-INVALID` | Conntrack invalid state inside the mesh tunnel |
 | `XNFT-MESH-SPOOF` | Packet inside `wg0` with source IP outside `@MESH_PEERS` |
-| `XNFT-MESH-UNKNOWN` | Packet inside `wg0` from unrecognised source |
+| `XNFT-MESH-DENY` | Mesh peer traffic to a port not in the services allowlist |
 | `XNFT-WG-RATELIMIT` | WireGuard handshake per-source rate limit exceeded |
 | `XNFT-BREAKGLASS-RATELIMIT` | Break-glass SSH rate limit exceeded (brute-force attempt) |
-| `XNFT-BOGON` | Bogon/martian source IP on public interface |
-| `XNFT-LOOPBACK-SPOOF` | 127.x / ::1 source on non-loopback interface |
+| `XNFT-BOGON` | Bogon/martian IPv4 source on public interface |
+| `XNFT-BOGON6` | Bogon/martian IPv6 source on public interface |
+| `XNFT-LOOPBACK-SPOOF` | 127.x source on non-loopback interface |
+| `XNFT-LOOPBACK6-SPOOF` | ::1 source on non-loopback interface |
+| `XNFT-MESH-SPOOF6` | IPv6 packet inside `wg0` with source outside `@MESH_PEERS6` |
+| `XNFT-NDP-OFFLINK` | NDP packet with hoplimit ≠ 255 (off-link forgery attempt) |
 | `XNFT-TCPFL-NULL` | TCP NULL scan (no flags) |
 | `XNFT-TCPFL-XMAS` | TCP XMAS scan (FIN+PSH+URG) |
 | `XNFT-TCPFL-SYNFIN` | TCP SYN+FIN (impossible combination) |
@@ -464,6 +479,28 @@ sudo nft delete rule inet filter input handle <HANDLE>
 
 ---
 
+## Testing the ruleset
+
+The [`tests/`](./tests) directory contains a 29-test enforcement suite that loads the ruleset into an isolated network namespace and fires real packets at it — verifying that the mesh actually accepts, the internet actually gets dropped, spoofed sources are caught, and rate limits trigger.
+
+```bash
+# Run everything in an isolated netns (requires root; nothing touches your live firewall)
+sudo ./tests/run-tests.sh --netns
+
+# Verbose TAP output
+sudo ./tests/run-tests.sh --netns --verbose
+```
+
+The same suite runs in CI on every push (ubuntu-24.04, real kernel, real nftables), so a rule change that silently breaks enforcement fails the build — not your production host. See [tests/README.md](./tests/README.md) for the full test matrix and how to add tests for new services.
+
+---
+
+## Deploying to production
+
+[DEPLOYMENT.md](./DEPLOYMENT.md) is a phase-by-phase checklist for moving this ruleset onto a remote host without locking yourself out: pre-flight audit, out-of-band access, WireGuard-first ordering, staged apply with `--confirm-timeout`, post-deploy verification from inside and outside the mesh, and rollback procedures. Read it before touching a machine you cannot walk over to.
+
+---
+
 ## Security model
 
 ### What this policy protects against
@@ -475,7 +512,7 @@ sudo nft delete rule inet filter input handle <HANDLE>
 | Brute-force SSH | SSH is invisible to non-mesh traffic; rate-limited within mesh |
 | Spoofed source IPs inside tunnel | WireGuard `AllowedIPs` + nftables `@MESH_PEERS` dual check |
 | WireGuard handshake flood (DoS) | Per-source meter — attacker can only exhaust their own budget |
-| TCP scan techniques (NULL/XMAS/FIN) | Detected and dropped in `05-antiscan.nft` with dedicated log prefixes |
+| TCP scan techniques (NULL/XMAS/FIN) | Detected and dropped in `10-antiscan.nft` with dedicated log prefixes |
 | SYN flood | Per-source rate limit (+ kernel SYN cookies recommended) |
 | Bogon / martian source addresses | `BOGON_V4` set blocks RFC1918/documentation/reserved ranges on public iface |
 | IP fragmentation attacks | Fragments dropped on public interface |
@@ -558,6 +595,8 @@ The forward chain had `policy drop` but no `ct state established accept`. WireGu
 
 **Fix:** `ct invalid` drop + `ct established` accept added to forward chain in `70-logging.nft`.
 
+**Honesty note (v3):** this fix was incomplete. With no `ct state new` accept in the forward chain, no forwarded connection could ever *become* established — the established accept was dead code and hub routing still didn't work. See BUG v3-11 below.
+
 ---
 
 ### BUG 10A — `flush ruleset` destroyed Docker/libvirt NAT rules
@@ -578,6 +617,80 @@ Only the `inet filter` table is touched. Docker's tables are untouched.
 `flush ruleset` (now fixed as 10A) executed immediately when encountered. A syntax error in any subsequent include caused: rules flushed, load aborted, machine left with no firewall.
 
 **Fix:** `reload.sh` script validates with `nft -c` before applying. Scoped table flush means a failed load leaves the old rules intact rather than leaving nothing.
+
+---
+
+## Known bugs fixed in v3 (the 5-model audit)
+
+For v3, the entire repository was independently audited by five frontier AI models, and every finding was cross-checked against `man nft`, kernel behaviour, and a real-packet test suite. The two worst findings were **breaking**: v2 could not load at all on modern nftables (≥1.1), and even where it loaded, it dropped every new TCP connection. If you are running v2, upgrade now.
+
+### BUG v3-01 — SYN-flood meter killed ALL new TCP connections (CRITICAL)
+
+**v2 code:**
+```nft
+tcp flags & syn == syn ct state new \
+    meter syn_flood { ip saddr timeout 10s limit rate 30/second } \
+    comment "antiscan: SYN rate-limit meter (per-source)"        # ← NO VERDICT
+
+tcp flags & syn == syn ct state new \
+    log prefix "XNFT-SYNFLOOD: " drop comment "rate-limit exceeded"
+```
+The first rule has **no verdict** — matching a meter and then doing nothing is a no-op, so evaluation always continues to the second rule, which logs and drops **every** new SYN, under or over the limit. Since antiscan runs before the mesh chains, every new TCP connection on the box — mesh included — was dropped. Established flows kept working (their packets aren't bare SYNs), which makes this the nastiest kind of bug: everything looks fine until the first reconnect.
+
+**Fix:** a single meter with `limit rate over 30/second` that jumps to a dedicated `synflood_drop` chain (rate-limited log, unconditional drop). Under-limit SYNs fall through to normal evaluation. An IPv6 meter (keyed per /64 to resist address-hopping) was added alongside — v2 had no IPv6 SYN protection at all.
+
+### BUG v3-02 — Antiscan ran before loopback: all local traffic dropped (CRITICAL)
+
+`127.0.0.0/8` is (correctly) in `BOGON_V4`. But the v2 include order ran the bogon check **before** the loopback accept — so every packet on `lo` was logged and dropped. Postgres on localhost, systemd-resolved, anything using 127.0.0.1: dead. Files renumbered (`05-loopback.nft` now precedes `10-antiscan.nft`) so loopback is accepted before any bogon logic.
+
+### BUG v3-03 — Mesh ICMP rules were dead code
+
+`60-icmp.nft` had "allow ping from mesh peers" rules — but every wg0 packet was consumed by `jump mesh_input` in `20-mesh.nft` long before reaching file 60. Mesh peers could never ping the server. The echo accepts (v4+v6, rate-limited) now live inside `mesh_input` itself; `60-icmp.nft` is explicitly public-interface-only.
+
+### BUG v3-04 — WireGuard rate limiter: IPv6 lockout + fail-closed meter
+
+The v2 pattern was `meter { ip saddr … } accept` followed by an unconditional log+drop. Three problems. **(1) IPv6 lockout:** the meter matched `ip saddr` only, so every IPv6 datagram skipped the accept and hit the drop — IPv6 clients could never complete a handshake. **(2) Fail-closed:** the unbounded meter table, once full, could not track new sources — they never matched the accept and were dropped. An attacker who fills the meter locks every *new* peer out of the VPN. **(3)** 5/minute flirted with dropping legitimate handshake retries (initiations retransmit every ~5s).
+
+**Fix:** inverted to `limit rate over 10/minute` → dedicated log+drop chain (per-source v4, per-/64 v6 — an attacker owns their whole /64, so per-address v6 buckets could be rotated through), then `udp dport 51820 counter accept` — deliberately the **only** public accept in the entire ruleset, now covering both address families. Meters are bounded (`size 65535`) and a full meter degrades to "no rate limiting" (fail-open) — acceptable because WireGuard authenticates cryptographically; the rate limit is noise reduction, not the security boundary, and it must never become the outage.
+
+### BUG v3-05 — `ip6 nexthdr icmpv6` missed ICMPv6 behind extension headers
+
+`nexthdr` matches only the *first* header after the fixed IPv6 header. An attacker inserting a hop-by-hop or fragment extension header bypassed every ICMPv6 rule written with `nexthdr`. All ICMPv6 matching now uses `meta l4proto icmpv6`, which walks the extension-header chain.
+
+### BUG v3-06 — IPv6 mesh spoof check existed but was commented out
+
+The v2 anti-spoof for IPv6 (`@MESH_PEERS6`) was scaffolding-only. It is now active: with an empty `MESH_PEERS6` set the mesh is deny-all for IPv6 (fail-closed), and spoofed v6 sources log as `XNFT-MESH-SPOOF6`.
+
+### BUG v3-07 — `XNFT-MESH-UNKNOWN` was a lie
+
+The prefix implied "unknown peer", but the rule actually fires for **known** peers hitting ports not in the services allowlist (unknown sources are caught earlier by the spoof check). Renamed to `XNFT-MESH-DENY` with an honest comment. If you built alerting on `MESH-UNKNOWN`, update it.
+
+### BUG v3-08 — Fragment check missed the more-fragments flag
+
+Mask `0x1fff` catches only non-zero fragment *offsets* — the first fragment of a fragmented packet (offset 0, MF=1) passed through. Mask is now `0x3fff` (offset bits + MF bit), catching every fragment including the first.
+
+### BUG v3-09 — SSH rate limit was a single global bucket
+
+Same class as v2's BUG 3A, missed in the SSH rules: `limit rate 6/minute` is one shared counter, so one noisy peer locked every other mesh peer out of SSH. Replaced with per-source meters (`ssh_rl` / `ssh_rl6`, over 6/minute → log+drop chain).
+
+### BUG v3-10 — NDP accepted with any hop limit
+
+RFC 4861 requires NDP packets arrive with hoplimit 255 (proof the packet wasn't forwarded). v2 accepted NDP at any hop limit, allowing off-link NDP injection. Now only hoplimit-255 NDP is accepted; the rest logs as `XNFT-NDP-OFFLINK`.
+
+### BUG v3-11 — Forward chain could never establish a connection
+
+The v2 BUG 9A "fix" added `ct established accept` to the forward chain but no `ct state new` rule — so the first packet of any forwarded flow was dropped and nothing ever became established. Hub routing remained broken while the README claimed it fixed. A commented hub-routing template (mesh-to-mesh `ct state new` accept + `ip_forward` sysctl instructions) now ships in `70-logging.nft`; the default remains deny-all forwarding.
+
+### BOGON set rejected by modern nftables (BREAKING)
+
+`255.255.255.255/32` overlapped with `240.0.0.0/4` in the `BOGON_V4` interval set. nftables ≥1.1 rejects conflicting intervals at load time — **v2 did not load at all** on Ubuntu 24.04+, Debian 13, Arch, or any current distro. The redundant element was removed (240/4 already covers it).
+
+### Tooling fixes in the same audit
+
+- **reload.sh**: snapshot now written to root-owned `/run/xnftables` with mode 600 (was world-readable `/tmp`, a TOCTOU + information-disclosure risk); restore file begins with `flush ruleset` so a rollback **replaces** the live ruleset instead of merging into it; the `--confirm-timeout` revert is now a blocking "type `keep`" prompt instead of a background job you had to race to kill.
+- **check.sh**: no longer exits 0 silently when run without root — it tells you what it could and couldn't validate.
+- **monitor**: the notification pipeline had a bug where a log line written to stdout corrupted the JSON findings payload — the monitor could detect a CVE and then crash before notifying anyone. Logs now go to stderr, secrets never appear on argv, and the systemd unit is fully sandboxed. See [MONITOR.md](./MONITOR.md).
+- **CI**: all actions pinned to commit SHAs, all third-party binaries pinned to SHA-256 checksums, secret scanning (gitleaks), workflow audit (zizmor), and the enforcement test suite now run on every push — 9 jobs total.
 
 ---
 
@@ -739,7 +852,7 @@ nmap -sX your.server.ip   # XMAS scan: FIN+PSH+URG
 nmap -sF your.server.ip   # FIN scan: bare FIN
 ```
 
-`05-antiscan.nft` drops all of these with dedicated log prefixes, so you can see the scan attempt in logs and correlate with other activity.
+`10-antiscan.nft` drops all of these with dedicated log prefixes, so you can see the scan attempt in logs and correlate with other activity.
 
 ### The compromised mesh peer
 
@@ -818,7 +931,7 @@ Tailscale manages WireGuard via its own daemon and creates a `tailscale0` interf
 # 20-mesh.nft — change interface name
 iifname "tailscale0" jump mesh_input
 
-# 05-antiscan.nft — exclude tailscale interface from bogon filter
+# 10-antiscan.nft — exclude tailscale interface from bogon filter
 iifname != "tailscale0" ip saddr @BOGON_V4 drop
 ```
 
@@ -861,17 +974,18 @@ Rulesets rot.  Kernel netfilter patches land weekly.  New CVEs get published aga
 
 Every finding is automatically mapped to the rule file most likely affected (a conntrack CVE → `rules/30-established.nft`, a WireGuard patch → `rules/20-mesh.nft` + `rules/50-vpn-endpoint.nft`, etc.) so the notification is immediately actionable.
 
-Notifications go to whichever of **Slack, Discord, email, Notion** you configure.  Only HIGH and CRITICAL findings trigger pings.  MEDIUM findings (new releases, API changes) go to Notion only.  Everything is logged to stdout.
+Notifications go to whichever of **Slack, Discord, email, Notion** you configure.  Only HIGH and CRITICAL findings trigger pings.  MEDIUM findings (new releases, API changes) go to Notion only.  The digest prints to stdout; diagnostic logs go to stderr.  Secrets are never passed on the command line (curl reads them via `--config -` on stdin).
 
 ### Quickstart
 
 ```bash
 cd scripts/monitor
 cp .env.example .env && $EDITOR .env   # fill in your webhook URLs / tokens
+chmod 600 .env                         # script refuses world-readable secrets
 chmod +x xnft-monitor.sh
 
 # Test — dry-run, no notifications sent
-DRY_RUN=1 ./xnft-monitor.sh
+./xnft-monitor.sh --dry-run
 
 # Add to crontab (weekdays at 08:00)
 crontab -e
@@ -939,13 +1053,18 @@ chain forward {
 
 ### Connection rate limiting per service
 
+Use a per-source meter with `limit rate over` — a bare `limit rate` is a single global bucket (one noisy client locks everyone out), and a meter *without* `over` matches the packets **under** the limit, which inverts the logic entirely (see BUG v3-01):
+
 ```nft
 tcp dport 22 ct state new \
-    limit rate 6/minute \
-    accept comment "service: SSH new-conn rate-limit"
-tcp dport 22 ct state new \
-    log prefix "XNFT-SSH-RATELIMIT: " drop comment "service: SSH rate exceeded"
+    meter ssh_rl { ip saddr timeout 60s limit rate over 6/minute } \
+    jump ssh_ratelimit_drop comment "service: SSH per-source rate-limit"
 tcp dport 22 accept comment "service: SSH"
+
+chain ssh_ratelimit_drop {
+    limit rate 5/minute log prefix "XNFT-SSH-RATELIMIT: " comment "log (rate-limited)"
+    drop comment "drop everything over the meter limit"
+}
 ```
 
 ### Early invalid-drop at raw priority (performance)
@@ -1048,13 +1167,19 @@ Testing
 
 ---
 
-## Tested on
+## Compatibility
 
-| Distro | Kernel | nftables |
+Every push is validated in CI on **Ubuntu 24.04** (real kernel, real nftables): full syntax check plus the 29-test enforcement suite firing real packets in a network namespace. That is the only environment we can honestly claim is *tested*.
+
+The ruleset is designed for:
+
+| Requirement | Minimum | Why |
 |---|---|---|
-| Debian 12 (Bookworm) | 6.1 | 1.0.6 |
-| Ubuntu 24.04 LTS | 6.8 | 1.0.9 |
-| Arch Linux (rolling) | 6.9+ | 1.1.x |
+| Linux kernel | ≥ 5.6 | Native WireGuard; modern nft meter/set semantics |
+| nftables | ≥ 1.0.6 | `meter … limit rate over`, inet-family NDP matches |
+| WireGuard | any | wg-quick or systemd-networkd both fine |
+
+Any mainstream distro meeting those minimums (Debian 12+, Ubuntu 22.04+, Arch, Fedora, Alpine) should work. If it doesn't, [open an issue](https://github.com/paulfxyz/xnftables/issues) — compatibility reports are welcome contributions.
 
 ---
 

@@ -1,3 +1,30 @@
+# =============================================================================
+# xnftables CI — validation + static analysis security testing (SAST)
+# =============================================================================
+# Jobs:
+#   nft-syntax   — kernel-independent dry-run of the full ruleset (nft -c)
+#   enforcement  — the REAL test: loads the ruleset in a network namespace and
+#                  fires actual packets at it (tests/run-tests.sh, TAP output)
+#   rule-hygiene — every rule commented, no RFC 5737 doc IPs in allowlists
+#   shellcheck   — SAST for every bash script (reload, check, monitor, tests)
+#   shfmt        — consistent shell formatting (diff-only, fails on drift)
+#   actionlint   — SAST for the workflows themselves
+#   zizmor       — security audit of GitHub Actions (pwn requests, injection,
+#                  excessive permissions, unpinned actions)
+#   gitleaks     — secret scanning over full git history (webhooks, tokens)
+#   systemd-verify — validate monitor.service / monitor.timer units
+#
+# Supply-chain hygiene: every action is pinned to a full commit SHA and every
+# downloaded tool binary is pinned to a version AND a sha256 checksum.  A tag
+# (v4) can be moved to malicious code; a SHA and a checksum cannot.
+#
+# Philosophy: same as the ruleset. Deny by default — a warning is a failure
+# unless explicitly, visibly downgraded with a reason.
+#
+# NOTE: this file must keep the name "validate.yml" — the README badge URL
+# references the workflow by filename.
+# =============================================================================
+
 name: Validate nftables syntax
 
 on:
@@ -5,19 +32,35 @@ on:
     paths:
       - 'rules/**'
       - 'nftables.conf'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/**'
   pull_request:
     paths:
       - 'rules/**'
       - 'nftables.conf'
+      - 'scripts/**'
+      - 'tests/**'
+      - '.github/workflows/**'
+
+# Least privilege at the CI layer too: read-only token for every job.
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
-  validate:
+  # ---------------------------------------------------------------------------
+  # Ruleset validation — parse
+  # ---------------------------------------------------------------------------
+  nft-syntax:
     name: nft syntax check
     runs-on: ubuntu-24.04
-
     steps:
       - name: Checkout
-        uses: actions/checkout@v4
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
 
       - name: Install nftables
         run: |
@@ -35,26 +78,181 @@ jobs:
           sudo nft -c -f /etc/nftables/nftables.conf
           echo "Syntax OK"
 
+  # ---------------------------------------------------------------------------
+  # Ruleset validation — behaviour ("nft -c proves it parses, nothing more")
+  # ---------------------------------------------------------------------------
+  enforcement:
+    name: enforcement tests (netns)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install nftables + test tools
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y nftables python3 iproute2 iputils-ping
+
+      - name: Run enforcement test suite
+        run: |
+          # Loads the real ruleset into a throw-away network namespace and
+          # fires real packets at it from a second namespace.  TAP output.
+          # Nothing outside tests/ is touched; the host firewall is never
+          # modified.
+          sudo ./tests/run-tests.sh --netns --verbose
+
+  rule-hygiene:
+    name: rule hygiene
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
       - name: Check for rules without comments
         run: |
-          # Every accept/drop rule should have a comment= field.
-          # This catches rules added without documentation.
-          missing=$(grep -rn '^\s*\(accept\|drop\|log\)' rules/ \
-            | grep -v 'comment' \
-            | grep -v '^\s*#' || true)
-          if [[ -n "$missing" ]]; then
-            echo "WARNING: Rules without comment= field:"
-            echo "$missing"
-            # Non-fatal for now — change to 'exit 1' to enforce strictly
-          fi
+          # Every accept/drop/log rule should carry a comment= field.
+          # Rules are written multi-line with trailing backslashes, so join
+          # continuation lines FIRST, then check the logical rule — checking
+          # raw lines flagged ~27 false positives (v2 CI bug).
+          found=0
+          for f in rules/*.nft; do
+            # join "\"-continued lines, drop pure comment lines, then flag any
+            # logical rule ending in accept/drop that lacks a comment= field
+            while IFS= read -r line; do
+              echo "::warning file=$f::rule without comment= field: $line"
+              found=1
+            done < <(sed -e ':a' -e '/\\$/{N; s/\\\n//; ba' -e '}' "$f" \
+              | grep -vE '^\s*#' \
+              | grep -E '\b(accept|drop)\s*$' \
+              | grep -v 'comment' || true)
+          done
+          # Warning-level for now — change to 'exit "$found"' to enforce.
+          [[ $found -eq 0 ]] && echo "comment hygiene OK"
+          exit 0
 
-      - name: Check for RFC 5737 documentation IPs in ADMIN_ALLOWLIST
+      - name: Check for RFC 5737 documentation IPs in allowlists
         run: |
           # Documentation IPs (192.0.2.x, 198.51.100.x, 203.0.113.x) are
-          # unroutable and should never appear in production allowlists.
-          if grep -E '(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)' rules/00-tables.nft \
-             | grep -v '^\s*#'; then
-            echo "ERROR: RFC 5737 documentation IP found in active rule (not commented out)"
+          # unroutable and must never appear in a production ALLOWLIST.
+          # They legitimately appear in the BOGON_V4 block set — v2 of this
+          # check scanned every rule file and was permanently red (CI bug).
+          # Scope: only the ADMIN_ALLOWLIST definition block.
+          block=$(awk '/set ADMIN_ALLOWLIST/,/^    \}/' rules/00-tables.nft)
+          if printf '%s\n' "$block" | grep -v '^\s*#' \
+             | grep -E '(192\.0\.2\.|198\.51\.100\.|203\.0\.113\.)'; then
+            echo "::error::RFC 5737 documentation IP active in ADMIN_ALLOWLIST"
             exit 1
           fi
           echo "IP check OK"
+
+  # ---------------------------------------------------------------------------
+  # SAST — shell scripts
+  # ---------------------------------------------------------------------------
+  shellcheck:
+    name: shellcheck (SAST)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Install shellcheck
+        run: sudo apt-get update -qq && sudo apt-get install -y shellcheck
+
+      - name: Run shellcheck on all shell scripts
+        run: |
+          # -x follows sourced files (tests/lib.sh), -S style = strictest level:
+          # even style suggestions fail the build. Deny-all, remember?
+          mapfile -t scripts < <(find . -name '*.sh' -not -path './.git/*')
+          printf 'Checking %d scripts\n' "${#scripts[@]}"
+          shellcheck -x -S style "${scripts[@]}"
+
+  shfmt:
+    name: shfmt formatting
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Check formatting with shfmt (pinned binary + checksum)
+        run: |
+          curl -fsSL -o shfmt \
+            https://github.com/mvdan/sh/releases/download/v3.10.0/shfmt_v3.10.0_linux_amd64
+          echo "1f57a384d59542f8fac5f503da1f3ea44242f46dff969569e80b524d64b71dbc  shfmt" | sha256sum -c -
+          chmod +x shfmt
+          ./shfmt -d -i 2 -ci -sr scripts/ tests/
+
+  # ---------------------------------------------------------------------------
+  # SAST — the CI pipeline itself
+  # ---------------------------------------------------------------------------
+  actionlint:
+    name: actionlint (workflow lint)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run actionlint (pinned binary + checksum)
+        run: |
+          curl -fsSL -o actionlint.tar.gz \
+            https://github.com/rhysd/actionlint/releases/download/v1.7.7/actionlint_1.7.7_linux_amd64.tar.gz
+          echo "023070a287cd8cccd71515fedc843f1985bf96c436b7effaecce67290e7e0757  actionlint.tar.gz" | sha256sum -c -
+          tar -xzf actionlint.tar.gz actionlint
+          ./actionlint -color
+
+  zizmor:
+    name: zizmor (Actions security audit)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Run zizmor
+        run: |
+          pipx install zizmor
+          # Audits workflows for template injection, pwn-request patterns,
+          # missing permissions blocks, unpinned mutable action refs, etc.
+          zizmor --no-progress .github/workflows/
+
+  # ---------------------------------------------------------------------------
+  # Secret scanning — full history
+  # ---------------------------------------------------------------------------
+  gitleaks:
+    name: gitleaks (secret scan)
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout (full history)
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+        with:
+          fetch-depth: 0
+
+      - name: Run gitleaks (pinned binary + checksum)
+        run: |
+          # Scans every commit for webhook URLs, API tokens, private keys.
+          # The monitor's .env is gitignored — this verifies nothing leaked anyway.
+          curl -fsSL -o gitleaks.tar.gz \
+            https://github.com/gitleaks/gitleaks/releases/download/v8.24.3/gitleaks_8.24.3_linux_x64.tar.gz
+          echo "9991e0b2903da4c8f6122b5c3186448b927a5da4deef1fe45271c3793f4ee29c  gitleaks.tar.gz" | sha256sum -c -
+          tar -xzf gitleaks.tar.gz gitleaks
+          ./gitleaks git --no-banner --redact .
+
+  # ---------------------------------------------------------------------------
+  # systemd unit validation
+  # ---------------------------------------------------------------------------
+  systemd-verify:
+    name: systemd unit verify
+    runs-on: ubuntu-24.04
+    steps:
+      - name: Checkout
+        uses: actions/checkout@11bd71901bbe5b1630ceea73d27597364c9af683 # v4.2.2
+
+      - name: Verify monitor units
+        run: |
+          # systemd-analyze verify needs units in a search path and their
+          # referenced paths to exist; create the install layout it expects.
+          sudo mkdir -p /opt/xnftables/scripts/monitor
+          sudo cp scripts/monitor/xnft-monitor.sh /opt/xnftables/scripts/monitor/
+          sudo chmod +x /opt/xnftables/scripts/monitor/xnft-monitor.sh
+          sudo cp scripts/monitor/monitor.service /etc/systemd/system/xnft-monitor.service
+          sudo cp scripts/monitor/monitor.timer   /etc/systemd/system/xnft-monitor.timer
+          systemd-analyze verify xnft-monitor.service xnft-monitor.timer
+          echo "Units OK"

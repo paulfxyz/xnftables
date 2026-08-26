@@ -85,8 +85,8 @@ right file, not the whole repo.
 | `forward` / `routing` | `rules/70-logging.nft` |
 | `log` / `nflog` | `rules/70-logging.nft` |
 | `nat` / `masquerade` | `nftables.conf` |
-| `tcp` / `flag` | `rules/05-antiscan.nft` |
-| `bogon` / `martian` / `fragment` | `rules/05-antiscan.nft` |
+| `tcp` / `flag` | `rules/10-antiscan.nft` |
+| `bogon` / `martian` / `fragment` | `rules/10-antiscan.nft` |
 
 If no keyword matches, the finding is flagged with `rules/ (review manually)`.
 
@@ -119,6 +119,7 @@ brew install curl jq
 ```bash
 cp .env.example .env
 $EDITOR .env
+chmod 600 .env   # the script refuses to source a group/world-readable .env
 ```
 
 Set whichever channels you want.  All fields are optional — leave unused ones
@@ -291,7 +292,7 @@ journalctl -u xnft-monitor.service -f
 
 ```bash
 # Dry-run: all checks, no notifications, prints digest to stdout
-DRY_RUN=1 ./xnft-monitor.sh
+./xnft-monitor.sh --dry-run          # or: DRY_RUN=1 ./xnft-monitor.sh
 
 # Test a specific channel without running all checks
 DRY_RUN=0 ./xnft-monitor.sh --notify slack
@@ -303,12 +304,18 @@ DRY_RUN=0 ./xnft-monitor.sh --notify all
 ./xnft-monitor.sh --notify none
 ```
 
-The findings JSON is always written to `/tmp/xnft-findings-YYYY-MM-DD.json`
-regardless of `DRY_RUN`, so you can inspect what would have been sent:
+The findings JSON is always written to
+`${XNFT_STATE_DIR:-/tmp}/xnft-findings-YYYY-MM-DD.json` regardless of dry-run,
+so you can inspect what would have been sent. Under the systemd unit,
+`XNFT_STATE_DIR=/var/lib/xnft-monitor`:
 
 ```bash
-cat /tmp/xnft-findings-$(date +%Y-%m-%d).json | jq .
+jq . /tmp/xnft-findings-$(date +%Y-%m-%d).json                    # manual runs
+sudo jq . /var/lib/xnft-monitor/xnft-findings-$(date +%Y-%m-%d).json  # systemd runs
 ```
+
+Diagnostic logs go to **stderr**, the human-readable digest to **stdout** — so
+`findings=$(…)` command substitution and cron redirects never mix the two.
 
 ---
 
@@ -316,7 +323,7 @@ cat /tmp/xnft-findings-$(date +%Y-%m-%d).json | jq .
 
 ```
 scripts/monitor/
-  xnft-monitor.sh          ← main script (571 lines, bash)
+  xnft-monitor.sh          ← main script (~900 lines, bash)
   .env.example             ← credential template (copy to .env)
   monitor.service          ← systemd service unit
   monitor.timer            ← systemd timer unit (Mon–Fri 08:00, Persistent)
@@ -344,7 +351,7 @@ MONITOR.md                 ← this file (full documentation)
 
 [MEDIUM] kernel.org
   New stable kernel: 6.9.3
-  Rule files: rules/30-established.nft, rules/05-antiscan.nft
+  Rule files: rules/30-established.nft, rules/10-antiscan.nft
   URL: https://www.kernel.org/pub/linux/kernel/…
 ════════════════════════════════════════════════
 ```

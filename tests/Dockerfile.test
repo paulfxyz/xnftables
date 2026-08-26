@@ -1,0 +1,61 @@
+# =============================================================================
+# Dockerfile.test — container image for the xnftables enforcement test suite
+# =============================================================================
+# Everything the suite needs and nothing else: nftables, iproute2 (netns +
+# veth), python3 (packet probes and listeners), iputils-ping, plus nmap/hping3
+# as optional fall-backs for the malformed-flag scans.
+#
+# BUILD
+#   docker build -f tests/Dockerfile.test -t xnftables-tests:local tests/
+#
+# RUN (the harness does this for you with ./tests/run-tests.sh --docker)
+#   docker run --rm --privileged -v "$PWD:/repo:ro" \
+#       xnftables-tests:local /repo/tests/run-tests.sh --netns
+#
+# WHY --privileged
+#   The suite creates network namespaces and veth pairs (CAP_NET_ADMIN), loads
+#   an nftables ruleset (CAP_NET_ADMIN + a writable network namespace) and sends
+#   hand-built TCP segments through raw sockets (CAP_NET_RAW).  The narrower
+#   equivalent usually works too:
+#       --cap-add NET_ADMIN --cap-add NET_RAW --security-opt seccomp=unconfined
+#   but --privileged is the reliable option across Docker/Podman versions.
+#
+# WHY THE HOST KERNEL STILL MATTERS
+#   Containers share the host kernel.  If the host has no nf_tables support
+#   (nf_tables, nft_ct, nft_log, nft_limit, nft_counter, nf_conntrack), the
+#   suite reports SKIP instead of PASS — no image can supply a missing kernel
+#   module.  See "Caveats" in tests/README.md.
+#
+# The repo is expected to be mounted read-only at /repo; the harness copies the
+# ruleset into a temp dir and rewrites its include paths, so it never needs to
+# write into /repo or /etc/nftables.
+#
+# SPDX-License-Identifier: MIT
+# =============================================================================
+FROM debian:trixie-slim
+
+# noninteractive: keep apt from asking about tzdata during the build.
+ENV DEBIAN_FRONTEND=noninteractive
+
+RUN apt-get update \
+    && apt-get install -y --no-install-recommends \
+        nftables \
+        iproute2 \
+        iputils-ping \
+        python3 \
+        procps \
+        nmap \
+        hping3 \
+        ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+
+# The suite is invoked from the mounted repo (/repo/tests/run-tests.sh).  The
+# copy below is only a convenience for `docker run xnftables-tests:local` with
+# no mount, e.g. to inspect the harness or run --list.
+WORKDIR /repo
+COPY . /opt/xnftables-tests/
+
+# Quick sanity output when the image is run with no command.
+CMD ["/bin/bash", "-lc", \
+     "nft --version && ip -V && python3 --version && \
+      echo 'mount the repo at /repo and run: /repo/tests/run-tests.sh --netns'"]

@@ -1,0 +1,184 @@
+# =============================================================================
+# 10-antiscan.nft — Bogon filtering, TCP flag abuse, SYN flood guard
+# =============================================================================
+# This file runs AFTER loopback (05-loopback.nft accepts lo traffic first —
+# 127.0.0.0/8 is in BOGON_V4, so bogon filtering before the loopback accept
+# would drop the host's own inter-process traffic; that was BUG v3-02) and
+# BEFORE mesh/conntrack rules, so malicious or impossible packets are dropped
+# at the earliest safe point in the chain.
+#
+# Protection layers:
+#
+#   1. BOGON / MARTIAN FILTERING (IPv4 + IPv6)
+#      Packets with RFC1918, documentation, loopback, or reserved source IPs
+#      arriving on public interfaces are either spoofed or misconfigured.
+#      Sets BOGON_V4 / BOGON_V6 are defined in 00-tables.nft.
+#      Note: wg0 is exempt — mesh peers use RFC1918 space (10.10.0.0/24) by
+#      design.  Bogon filtering applies to the public-facing interface only.
+#
+#   2. TCP FLAG ABUSE
+#      Flag combinations that never occur in valid traffic but are used by
+#      stealth scanners (nmap -sN/-sX/-sF) and DoS tools.  Logged and dropped.
+#
+#   3. SYN FLOOD GUARD
+#      Per-source rate limit on new TCP connection attempts.
+#      Complements kernel SYN cookies (net.ipv4.tcp_syncookies=1) — enable both.
+#
+#   4. FRAGMENT GUARD
+#      IP fragments on the public interface are dropped (evasion vector).
+#
+# LOGGING PATTERN (v3): every attacker-triggerable log is rate-limited in a
+# SEPARATE rule placed before an unconditional drop.  A single "log ... drop"
+# rule with a limit would stop DROPPING once the limit is exceeded (the limit
+# gates the whole rule) — splitting log and drop keeps the drop unconditional
+# while capping journal noise.  An attacker who can generate 1M pps must cost
+# you bandwidth, not disk space and journald CPU.
+# =============================================================================
+
+table inet filter {
+    chain input {
+
+        # =====================================================================
+        # 1. BOGON / MARTIAN SOURCE ADDRESS FILTER
+        # =====================================================================
+        # Only on non-WireGuard interfaces — mesh peers legitimately use
+        # 10.0.0.0/8 space.  Loopback was already accepted in 05-loopback.nft.
+
+        iifname != "wg0" ip saddr @BOGON_V4 \
+            limit rate 10/second burst 20 packets \
+            log prefix "XNFT-BOGON: " level info \
+            comment "antiscan: log bogon/martian source IPv4 (rate-limited)"
+        iifname != "wg0" ip saddr @BOGON_V4 \
+            counter drop comment "antiscan: drop bogon/martian source IPv4"
+
+        iifname != "wg0" ip6 saddr @BOGON_V6 \
+            limit rate 10/second burst 20 packets \
+            log prefix "XNFT-BOGON6: " level info \
+            comment "antiscan: log bogon/martian source IPv6 (rate-limited)"
+        iifname != "wg0" ip6 saddr @BOGON_V6 \
+            counter drop comment "antiscan: drop bogon/martian source IPv6"
+
+        # Loopback addresses arriving on a non-loopback interface — impossible
+        # in normal operation; indicates IP stack misbehaviour or spoofing.
+        iifname != "lo" ip saddr 127.0.0.0/8 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-LOOPBACK-SPOOF: " level warn \
+            comment "antiscan: log loopback-source spoof (rate-limited)"
+        iifname != "lo" ip saddr 127.0.0.0/8 \
+            counter drop comment "antiscan: loopback source on non-lo iface"
+
+        iifname != "lo" ip6 saddr ::1/128 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-LOOPBACK6-SPOOF: " level warn \
+            comment "antiscan: log IPv6 loopback-source spoof (rate-limited)"
+        iifname != "lo" ip6 saddr ::1/128 \
+            counter drop comment "antiscan: IPv6 loopback source on non-lo iface"
+
+        # =====================================================================
+        # 2. TCP FLAG ABUSE
+        # =====================================================================
+
+        # NULL scan — no TCP flags set.  RFC 9293 requires at least one flag.
+        tcp flags == 0x0 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-TCPFL-NULL: " level info \
+            comment "antiscan: log TCP NULL scan (rate-limited)"
+        tcp flags == 0x0 \
+            counter drop comment "antiscan: TCP NULL scan (no flags)"
+
+        # XMAS scan — FIN + PSH + URG simultaneously.
+        tcp flags & (fin|psh|urg) == fin|psh|urg \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-TCPFL-XMAS: " level info \
+            comment "antiscan: log TCP XMAS scan (rate-limited)"
+        tcp flags & (fin|psh|urg) == fin|psh|urg \
+            counter drop comment "antiscan: TCP XMAS scan (FIN+PSH+URG)"
+
+        # SYN + FIN — semantically impossible: open and close at once.
+        tcp flags & (syn|fin) == syn|fin \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-TCPFL-SYNFIN: " level info \
+            comment "antiscan: log TCP SYN+FIN (rate-limited)"
+        tcp flags & (syn|fin) == syn|fin \
+            counter drop comment "antiscan: TCP SYN+FIN (impossible)"
+
+        # SYN + RST — contradictory; malformed or spoofed packet.
+        tcp flags & (syn|rst) == syn|rst \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-TCPFL-SYNRST: " level info \
+            comment "antiscan: log TCP SYN+RST (rate-limited)"
+        tcp flags & (syn|rst) == syn|rst \
+            counter drop comment "antiscan: TCP SYN+RST (impossible)"
+
+        # FIN scan — bare FIN on a new connection.  Valid data-carrying FINs
+        # occur inside established connections (conntrack covers those).
+        tcp flags & (fin|ack) == fin \
+            ct state new \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-TCPFL-FIN: " level info \
+            comment "antiscan: log TCP FIN scan (rate-limited)"
+        tcp flags & (fin|ack) == fin \
+            ct state new \
+            counter drop comment "antiscan: TCP FIN scan (bare FIN, new conn)"
+
+        # =====================================================================
+        # 3. SYN FLOOD GUARD (per-source rate limit on new connections)
+        # =====================================================================
+        # BUG v3-01 (was): the v2 meter rule had NO VERDICT.  A meter match is
+        # non-terminal, so in-limit packets fell through to the next rule —
+        # which unconditionally dropped every new SYN.  The ruleset allowed no
+        # new TCP connections at all, from anywhere, including the mesh.
+        #
+        # The correct pattern is "limit rate over N" + drop in ONE rule:
+        #   - a source exceeding N new SYN/s matches → jump to rate-limited
+        #     log + drop
+        #   - a source within the limit does not match → packet continues to
+        #     mesh/services evaluation (no accept here — antiscan never
+        #     accepts, it only rejects garbage; that is its entire contract)
+        #
+        # size 65535 caps meter memory.  When the meter is FULL, new sources
+        # cannot be tracked, the rule cannot match, and packets continue —
+        # the limiter fails OPEN.  Deliberate: a full meter must degrade to
+        # "no rate limiting" rather than "no service".  Kernel SYN cookies
+        # remain as the backstop:
+        #   sysctl -w net.ipv4.tcp_syncookies=1
+
+        tcp flags & (syn|ack) == syn \
+            ct state new \
+            meter syn_flood size 65535 { ip saddr timeout 60s limit rate over 30/second } \
+            jump synflood_drop comment "antiscan: per-source SYN flood guard (IPv4)"
+
+        tcp flags & (syn|ack) == syn \
+            ct state new \
+            meter syn_flood6 size 65535 { ip6 saddr and ffff:ffff:ffff:ffff:: timeout 60s limit rate over 30/second } \
+            jump synflood_drop comment "antiscan: per-/64 SYN flood guard (IPv6)"
+
+        # =====================================================================
+        # 4. IP FRAGMENT GUARD
+        # =====================================================================
+        # frag-off & 0x3fff matches BOTH a non-zero fragment offset AND the
+        # more-fragments (MF) bit — 0x1fff (v2) missed the FIRST fragment,
+        # which has offset 0 with MF set.  That first fragment is exactly the
+        # one tiny-fragment evasion attacks rely on (BUG v3-08).
+        # WireGuard performs its own fragmentation inside the tunnel, so wg0
+        # never legitimately sees IP fragments either — but mesh MTU quirks
+        # are debuggable, spoofed fragments are not; wg0 stays exempt.
+
+        iifname != "wg0" ip frag-off & 0x3fff != 0 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-FRAGMENT: " level info \
+            comment "antiscan: log IPv4 fragment (rate-limited)"
+        iifname != "wg0" ip frag-off & 0x3fff != 0 \
+            counter drop comment "antiscan: fragmented IPv4 packet (public iface)"
+    }
+
+    # Rate-limited log + unconditional drop for SYN flood offenders.
+    # Separate chain so the meter rule stays single-purpose and the log can
+    # never gate the drop.
+    chain synflood_drop {
+        limit rate 10/second burst 20 packets \
+            log prefix "XNFT-SYNFLOOD: " level warn \
+            comment "antiscan: log SYN flood offender (rate-limited)"
+        counter drop comment "antiscan: drop SYN flood excess"
+    }
+}

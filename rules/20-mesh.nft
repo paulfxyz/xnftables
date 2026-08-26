@@ -33,7 +33,14 @@
 #   Peer range          : 10.10.0.2 – 10.10.0.254
 #
 # To use a different interface name (e.g. wg1, tailscale0, utun*):
-#   Change every "wg0" reference in this file AND in 05-antiscan.nft.
+#   Change every "wg0" reference in this file AND in 10-antiscan.nft.
+#
+# BUG FIX (v3-03) — mesh ICMP lived in dead code:
+#   mesh_input always terminates (accept, or the final drop), so wg0 traffic
+#   NEVER reached the ICMP rules in 60-icmp.nft — mesh peers could not ping
+#   the server at all.  ICMP for the mesh is now handled HERE, inside
+#   mesh_input, before the services jump.  60-icmp.nft covers the public
+#   interface only.
 # =============================================================================
 
 table inet filter {
@@ -52,12 +59,18 @@ table inet filter {
             accept comment "break-glass: emergency SSH (ADMIN_ALLOWLIST, public iface)"
 
         # Log excessive break-glass attempts (possible brute-force on the
-        # emergency back-door).
+        # emergency back-door).  Log and drop are SPLIT so the log's own rate
+        # limit can never gate the drop (see 10-antiscan.nft header).
         ip saddr @ADMIN_ALLOWLIST \
             tcp dport 22 \
             ct state new \
+            limit rate 6/minute burst 10 packets \
             log prefix "XNFT-BREAKGLASS-RATELIMIT: " level warn \
-            drop comment "break-glass: rate-limit exceeded"
+            comment "break-glass: log rate-limit excess (rate-limited)"
+        ip saddr @ADMIN_ALLOWLIST \
+            tcp dport 22 \
+            ct state new \
+            counter drop comment "break-glass: rate-limit exceeded"
 
         # --- Anti-spoof: drop wg0 packets with non-mesh source IP FIRST ---
         # BUG FIX (1A): This must precede the unconditional jump below.
@@ -66,13 +79,24 @@ table inet filter {
         # WireGuard server, or a tampered peer config).
         # This should never fire in normal operation — if it does, investigate.
         iifname "wg0" ip saddr != @MESH_PEERS \
+            limit rate 5/second burst 10 packets \
             log prefix "XNFT-MESH-SPOOF: " level warn \
-            drop comment "mesh: spoofed source IP inside wg0 tunnel"
+            comment "mesh: log spoofed IPv4 in tunnel (rate-limited)"
+        iifname "wg0" ip saddr != @MESH_PEERS \
+            counter drop comment "mesh: spoofed source IP inside wg0 tunnel"
 
-        # IPv6 anti-spoof (if MESH_PEERS6 is populated)
-        # iifname "wg0" ip6 saddr != @MESH_PEERS6 \
-        #     log prefix "XNFT-MESH-SPOOF6: " level warn \
-        #     drop comment "mesh: spoofed IPv6 source inside wg0 tunnel"
+        # IPv6 anti-spoof.  ACTIVE even with MESH_PEERS6 empty (BUG v3-06):
+        # v2 left this commented out, so IPv6 packets inside the tunnel
+        # bypassed source validation and fell to the mesh_input catch-all —
+        # same verdict (drop) but unvalidated and mislabelled in logs.  With
+        # an empty set the rule simply drops ALL IPv6 in the tunnel, which is
+        # the correct deny-by-default for an IPv4-only mesh.
+        iifname "wg0" ip6 saddr != @MESH_PEERS6 \
+            limit rate 5/second burst 10 packets \
+            log prefix "XNFT-MESH-SPOOF6: " level warn \
+            comment "mesh: log spoofed IPv6 in tunnel (rate-limited)"
+        iifname "wg0" ip6 saddr != @MESH_PEERS6 \
+            counter drop comment "mesh: spoofed IPv6 source inside wg0 tunnel"
 
         # --- WireGuard tunnel: jump to per-service allowlist ---
         # Only reached after the spoof check above passes.
@@ -98,19 +122,42 @@ table inet filter {
         ct state { established, related } \
             accept comment "mesh: conntrack established/related fast-path"
 
+        # --- Mesh ICMP (BUG FIX v3-03: moved here from 60-icmp.nft) ---
+        # Ping between authenticated peers is an operational necessity
+        # (reachability checks, MTU debugging).  Rate-limited to keep a
+        # compromised peer from using echo floods as a DoS vector.
+        ip saddr @MESH_PEERS \
+            icmp type echo-request \
+            limit rate 10/second burst 20 packets \
+            accept comment "mesh: ping from peers (rate-limited)"
+
+        ip6 saddr @MESH_PEERS6 \
+            icmpv6 type echo-request \
+            limit rate 10/second burst 20 packets \
+            accept comment "mesh: IPv6 ping from peers (rate-limited)"
+
+        # ICMP errors (dest-unreachable, time-exceeded, PMTUD) for existing
+        # flows are already covered by the established/related fast-path
+        # above — conntrack marks ICMP errors for known flows as "related".
+
         # Source-address validation: ensure the decrypted packet's source IP
         # belongs to a known mesh peer.  This catches the case where WireGuard
         # AllowedIPs is misconfigured more broadly than the mesh CIDR.
         ip saddr @MESH_PEERS \
             jump services comment "mesh: known IPv4 peer → services"
 
-        # IPv6 mesh peers (uncomment if MESH_PEERS6 is populated)
-        # ip6 saddr @MESH_PEERS6 \
-        #     jump services comment "mesh: known IPv6 peer → services"
+        # IPv6 mesh peers — no-op while MESH_PEERS6 is empty, active the
+        # moment you populate the set (00-tables.nft).
+        ip6 saddr @MESH_PEERS6 \
+            jump services comment "mesh: known IPv6 peer → services"
 
-        # Anything that exits wg0 with an unrecognised source IP.
-        # Should be caught by the spoof rule above, but belt-and-suspenders.
-        log prefix "XNFT-MESH-UNKNOWN: " level warn \
-            drop comment "mesh: unknown source IP in tunnel, drop"
+        # A known peer whose traffic matched nothing in the services chain
+        # lands here (the spoof check upstream already removed unknown
+        # sources).  Renamed from XNFT-MESH-UNKNOWN (v2) which mislabelled
+        # every denied-port packet as an "unknown source" (BUG v3-07).
+        limit rate 5/second burst 10 packets \
+            log prefix "XNFT-MESH-DENY: " level info \
+            comment "mesh: log peer traffic to non-allowlisted port (rate-limited)"
+        counter drop comment "mesh: peer port not in services allowlist, drop"
     }
 }

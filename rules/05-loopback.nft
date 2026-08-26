@@ -1,10 +1,12 @@
 # =============================================================================
-# 10-loopback.nft — Loopback interface (always allow)
+# 05-loopback.nft — Loopback interface (always allow)
 # =============================================================================
 # The loopback interface (lo) carries inter-process traffic on the same host:
 # DNS stubs, Unix-socket-over-IP bridges, systemd-resolved, Docker internal
 # networking, etc.  Dropping loopback breaks many daemons silently.
-# This rule MUST come before any drop rules.
+# This rule MUST come before any drop rules — including antiscan: 127.0.0.0/8
+# is in BOGON_V4, so if bogon filtering ran first it would drop the host's own
+# traffic (this was BUG v3-02; the file was renumbered 10→05 to fix it).
 # =============================================================================
 
 table inet filter {

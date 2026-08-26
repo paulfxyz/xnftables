@@ -1,17 +1,30 @@
 # =============================================================================
 # monitor.timer — systemd timer for xnft-monitor (weekdays at 08:00 local)
 # =============================================================================
+# Install and inspect:
+#   sudo systemctl enable --now xnft-monitor.timer
+#   systemctl list-timers xnft-monitor.timer
+#
+# NOTE: there is deliberately no "Requires=xnft-monitor.service" here.  In a
+# timer's [Unit] section that makes the *timer* depend on the service, so
+# `systemctl enable --now` pulls the oneshot in immediately — an unexpected run
+# and a duplicate notification.  The Unit= line in [Timer] below is what
+# schedules the service (it is also the implicit default for a same-named
+# unit, and is spelled out here for readability).
+# =============================================================================
 
 [Unit]
 Description=Run xnftables security monitor on weekday mornings
-Requires=xnft-monitor.service
 
 [Timer]
+Unit=xnft-monitor.service
 # Monday–Friday at 08:00 local time
 OnCalendar=Mon..Fri 08:00:00
-# If the system was off at 08:00, run within 15 minutes of next boot
+# If the system was off at 08:00, run once shortly after the next boot.
 Persistent=true
+# Spread the load: start up to 5 minutes (300 s) after the scheduled instant.
 RandomizedDelaySec=300
+AccuracySec=1min
 
 [Install]
 WantedBy=timers.target
