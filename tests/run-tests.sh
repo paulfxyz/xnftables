@@ -184,6 +184,13 @@ setup_environment() {
     return 1
   fi
 
+  # netfilter `log` statements printk only from the initial network namespace
+  # unless nf_log_all_netns is enabled (kernel default: 0).  Without this the
+  # observability test would find drops but no XNFT-* lines in dmesg.  Best
+  # effort: the test SKIPs gracefully when the sysctl stays off.
+  priv sysctl -qw net.netfilter.nf_log_all_netns=1 2> /dev/null ||
+    diag "could not enable net.netfilter.nf_log_all_netns (log test may skip)"
+
   if ! env_up 2> /tmp/xnft-envup.$$; then
     SKIP_REASON="namespace setup failed: $(tr '\n' ' ' < /tmp/xnft-envup.$$ | cut -c1-160)"
     rm -f /tmp/xnft-envup.$$

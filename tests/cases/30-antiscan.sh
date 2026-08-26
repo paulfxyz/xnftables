@@ -82,6 +82,14 @@ t_bogon_counter_drop() {
 t_scan_logs_present() {
   local desc="observability: XNFT-TCPFL-* log entries appear in the kernel log"
   enforcement_guard "$desc" || return 0
+  # netfilter log statements only printk from non-init netns when
+  # net.netfilter.nf_log_all_netns=1 (run-tests.sh enables it best-effort).
+  # If it is still off, drops happen silently in the namespace — SKIP, the
+  # counter tests above already prove enforcement.
+  if [[ "$(priv sysctl -n net.netfilter.nf_log_all_netns 2> /dev/null)" != "1" ]]; then
+    tap_skip "$desc" "nf_log_all_netns=0 — netns log statements do not reach the host kernel log"
+    return 0
+  fi
   # Re-send both patterns so the log lines are recent.
   scan_send "$CLI_NS" "$PUB_CLI_IP" "$PUB_SUT_IP" "$PORT_SCAN" null 2 || true
   scan_send "$CLI_NS" "$PUB_CLI_IP" "$PUB_SUT_IP" "$PORT_SCAN" xmas 2 || true
