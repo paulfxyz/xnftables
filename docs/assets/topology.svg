@@ -1,0 +1,82 @@
+<svg viewBox="0 0 1000 400" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <defs>
+    <style>
+      .lbl { fill:#8b949e; font-size:12px; }
+      .lbl-b { fill:#c9d1d9; font-size:13px; font-weight:600; }
+      .mono { font-family:Menlo,Consolas,'Courier New',monospace; font-size:11px; fill:#8b949e; }
+      .mono-hi { font-family:Menlo,Consolas,'Courier New',monospace; font-size:11px; fill:#79c0ff; }
+      .mono-ok { font-family:Menlo,Consolas,'Courier New',monospace; font-size:11px; fill:#7ee787; }
+      .mono-bad { font-family:Menlo,Consolas,'Courier New',monospace; font-size:11px; fill:#ffa198; }
+      .box-deny { fill:#3d1418; stroke:#f85149; stroke-width:1.5; }
+      .box-mesh { fill:#0d2818; stroke:#3fb950; stroke-width:1.5; }
+      .box-svc { fill:#0d1f14; stroke:#238636; stroke-width:1; }
+      .line-drop { stroke:#f85149; stroke-width:1.8; fill:none; marker-end:url(#arrowRed); stroke-dasharray:4 3; }
+      .line-tun { stroke:#3fb950; stroke-width:2.2; fill:none; marker-end:url(#arrowGreen); }
+    </style>
+    <marker id="arrowRed" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#f85149"/></marker>
+    <marker id="arrowGreen" markerWidth="10" markerHeight="10" refX="7" refY="3.5" orient="auto"><path d="M0,0 L7,3.5 L0,7 Z" fill="#3fb950"/></marker>
+  </defs>
+
+  <rect width="1000" height="400" fill="#0d1117"/>
+
+  <!-- Internet -->
+  <circle cx="110" cy="90" r="48" fill="#161b22" stroke="#30363d" stroke-width="1.5"/>
+  <text x="110" y="84" text-anchor="middle" class="lbl-b">Internet</text>
+  <text x="110" y="101" text-anchor="middle" class="lbl">scanners, bots,</text>
+  <text x="110" y="115" text-anchor="middle" class="lbl">randoms</text>
+
+  <!-- Scanner attempts -> deny box -->
+  <path class="line-drop" d="M155,72 C230,35 300,20 345,25"/>
+  <path class="line-drop" d="M158,90 C230,90 300,90 345,90"/>
+  <path class="line-drop" d="M155,108 C220,140 290,155 345,150"/>
+
+  <!-- Public interface / deny box -->
+  <rect x="345" y="15" width="220" height="165" rx="10" class="box-deny"/>
+  <text x="455" y="40" text-anchor="middle" class="lbl-b" fill="#ffa198">Public interface</text>
+  <text x="455" y="57" text-anchor="middle" class="mono">policy drop</text>
+  <line x1="365" y1="66" x2="545" y2="66" stroke="#f85149" stroke-width="0.5" opacity="0.4"/>
+  <text x="365" y="86" class="mono">tcp/*</text>       <text x="500" y="86" class="mono-bad" text-anchor="end">DROP</text>
+  <text x="365" y="104" class="mono">udp/*</text>      <text x="500" y="104" class="mono-bad" text-anchor="end">DROP</text>
+  <text x="365" y="122" class="mono">icmp echo</text>  <text x="500" y="122" class="mono-bad" text-anchor="end">DROP</text>
+  <text x="455" y="145" text-anchor="middle" class="lbl" fill="#ffa198">the only response on this</text>
+  <text x="455" y="159" text-anchor="middle" class="lbl" fill="#ffa198">interface is silence</text>
+
+  <!-- WireGuard port exception -->
+  <rect x="385" y="200" width="140" height="46" rx="8" class="box-mesh"/>
+  <text x="455" y="219" text-anchor="middle" class="mono-ok">udp/51820</text>
+  <text x="455" y="235" text-anchor="middle" class="lbl" fill="#7ee787">WireGuard only</text>
+  <path d="M455,180 L455,200" stroke="#3fb950" stroke-width="1.5" fill="none"/>
+
+  <!-- valid peer path -->
+  <circle cx="200" cy="290" r="36" fill="#0d2818" stroke="#3fb950" stroke-width="1.5"/>
+  <text x="200" y="286" text-anchor="middle" class="lbl-b" fill="#7ee787">Peer</text>
+  <text x="200" y="301" text-anchor="middle" class="lbl" fill="#7ee787">valid key</text>
+  <path class="line-tun" d="M236,278 C290,255 330,240 383,224"/>
+  <text x="290" y="255" text-anchor="middle" class="mono-ok">Noise handshake</text>
+
+  <!-- WireGuard decrypts, hands off to mesh -->
+  <path class="line-tun" d="M525,218 C565,205 590,195 618,178"/>
+  <text x="572" y="255" text-anchor="middle" class="mono-ok" font-size="10.5">decrypts</text>
+
+  <!-- Mesh box -->
+  <rect x="620" y="55" width="330" height="290" rx="10" class="box-mesh"/>
+  <text x="785" y="82" text-anchor="middle" class="lbl-b" fill="#7ee787">wg0 — the mesh (10.10.0.0/24)</text>
+  <text x="785" y="99" text-anchor="middle" class="mono">jump mesh_input</text>
+  <line x1="640" y1="108" x2="930" y2="108" stroke="#3fb950" stroke-width="0.5" opacity="0.4"/>
+
+  <text x="645" y="130" class="mono">saddr in MESH_PEERS ?</text>
+  <text x="645" y="150" class="mono">no</text>  <text x="930" y="150" class="mono-bad" text-anchor="end">MESH-SPOOF (drop)</text>
+  <text x="645" y="170" class="mono">yes</text> <text x="930" y="170" class="mono-ok" text-anchor="end">jump services</text>
+
+  <!-- services inside mesh -->
+  <rect x="645" y="190" width="280" height="135" rx="8" class="box-svc"/>
+  <text x="785" y="212" text-anchor="middle" class="lbl-b" fill="#7ee787">services chain</text>
+  <line x1="660" y1="220" x2="910" y2="220" stroke="#238636" stroke-width="0.5" opacity="0.5"/>
+  <text x="662" y="240" class="mono">tcp/22</text>     <text x="908" y="240" class="mono-ok" text-anchor="end">accept (SSH)</text>
+  <text x="662" y="260" class="mono">tcp/443</text>    <text x="908" y="260" class="mono-ok" text-anchor="end">accept (if enabled)</text>
+  <text x="662" y="280" class="mono">icmp echo</text>  <text x="908" y="280" class="mono-ok" text-anchor="end">accept (rate-limited)</text>
+  <text x="662" y="300" class="mono">else</text>       <text x="908" y="300" class="mono-bad" text-anchor="end">MESH-DENY</text>
+
+  <!-- caption -->
+  <text x="500" y="378" text-anchor="middle" class="lbl">If you are not inside the mesh, you see nothing. Every exception is explicit, documented, and auditable.</text>
+</svg>

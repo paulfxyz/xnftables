@@ -1,0 +1,104 @@
+<svg viewBox="0 0 1040 300" xmlns="http://www.w3.org/2000/svg" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif">
+  <defs>
+    <style>
+      .stage { fill:#161b22; stroke:#30363d; stroke-width:1.5; }
+      .stage-deny { fill:#3d1418; stroke:#f85149; stroke-width:1.5; }
+      .stage-mesh { fill:#0d2818; stroke:#3fb950; stroke-width:1.5; }
+      .stage-final { fill:#132139; stroke:#58a6ff; stroke-width:1.5; }
+      .t-file { fill:#8b949e; font-size:11px; font-family:Menlo,Consolas,'Courier New',monospace; }
+      .t-title { fill:#c9d1d9; font-size:13px; font-weight:700; }
+      .t-title-ok { fill:#7ee787; font-size:13px; font-weight:700; }
+      .t-title-hi { fill:#a5d6ff; font-size:13px; font-weight:700; }
+      .t-sub { fill:#8b949e; font-size:10.5px; }
+      .t-sub-ok { fill:#a8d6b3; font-size:10.5px; }
+      .t-sub-hi { fill:#8ec4e8; font-size:10.5px; }
+      .t-bad { fill:#ffa198; font-size:10.5px; }
+      .arrow { stroke:#484f58; stroke-width:1.8; fill:none; marker-end:url(#a); }
+      .drop-arrow { stroke:#f85149; stroke-width:1.6; fill:none; marker-end:url(#ar); stroke-dasharray:3 3; }
+    </style>
+    <marker id="a" markerWidth="9" markerHeight="9" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L6.5,3.5 L0,7 Z" fill="#484f58"/></marker>
+    <marker id="ar" markerWidth="9" markerHeight="9" refX="6.5" refY="3.5" orient="auto"><path d="M0,0 L6.5,3.5 L0,7 Z" fill="#f85149"/></marker>
+  </defs>
+
+  <rect width="1040" height="300" fill="#0d1117"/>
+
+  <!-- incoming packet -->
+  <circle cx="28" cy="150" r="15" fill="#21262d" stroke="#484f58" stroke-width="1.5"/>
+  <path class="arrow" d="M43,150 L68,150"/>
+
+  <!-- stage 1: loopback -->
+  <g>
+    <rect x="70" y="112" width="118" height="78" rx="10" class="stage"/>
+    <text x="129" y="134" text-anchor="middle" class="t-title">loopback</text>
+    <text x="129" y="150" text-anchor="middle" class="t-sub">iifname lo</text>
+    <text x="129" y="164" text-anchor="middle" class="t-sub">accept</text>
+    <text x="129" y="184" text-anchor="middle" class="t-file">05-loopback.nft</text>
+  </g>
+  <path class="arrow" d="M188,150 L212,150"/>
+
+  <!-- stage 2: antiscan -->
+  <g>
+    <rect x="214" y="100" width="140" height="102" rx="10" class="stage"/>
+    <text x="284" y="122" text-anchor="middle" class="t-title">antiscan</text>
+    <text x="284" y="138" text-anchor="middle" class="t-sub">bogons, NULL/XMAS,</text>
+    <text x="284" y="152" text-anchor="middle" class="t-sub">SYN flood, fragments</text>
+    <text x="284" y="170" text-anchor="middle" class="t-bad">over limit: drop</text>
+    <text x="284" y="196" text-anchor="middle" class="t-file">10-antiscan.nft</text>
+  </g>
+  <path class="drop-arrow" d="M240,100 C230,70 250,55 285,52"/>
+  <text x="180" y="46" text-anchor="middle" class="t-bad">bogon / scan / flood</text>
+  <path class="arrow" d="M354,150 L378,150"/>
+
+  <!-- stage 3: mesh -->
+  <g>
+    <rect x="380" y="72" width="200" height="158" rx="10" class="stage-mesh"/>
+    <text x="480" y="95" text-anchor="middle" class="t-title-ok">mesh trust boundary</text>
+    <text x="480" y="112" text-anchor="middle" class="t-sub-ok">wg0, saddr in MESH_PEERS ?</text>
+    <text x="480" y="134" text-anchor="middle" class="t-sub-ok">ct invalid: drop</text>
+    <text x="480" y="150" text-anchor="middle" class="t-sub-ok">ct established: accept</text>
+    <text x="480" y="166" text-anchor="middle" class="t-sub-ok">mesh icmp echo: accept</text>
+    <text x="480" y="182" text-anchor="middle" class="t-sub-ok">known peer: jump services</text>
+    <text x="480" y="216" text-anchor="middle" class="t-file">20-mesh.nft</text>
+  </g>
+  <path class="drop-arrow" d="M440,72 C430,44 400,32 360,36"/>
+  <text x="270" y="30" text-anchor="middle" class="t-bad">spoofed / unknown source: MESH-DENY</text>
+  <path class="arrow" d="M580,150 L604,150"/>
+
+  <!-- stage 4: established (public) -->
+  <g>
+    <rect x="606" y="112" width="128" height="78" rx="10" class="stage"/>
+    <text x="670" y="134" text-anchor="middle" class="t-title">established</text>
+    <text x="670" y="150" text-anchor="middle" class="t-sub">ct fast-path</text>
+    <text x="670" y="164" text-anchor="middle" class="t-sub">(public iface)</text>
+    <text x="670" y="184" text-anchor="middle" class="t-file">30-established.nft</text>
+  </g>
+  <path class="arrow" d="M734,150 L758,150"/>
+
+  <!-- stage 5: vpn endpoint -->
+  <g>
+    <rect x="760" y="100" width="128" height="102" rx="10" class="stage-final"/>
+    <text x="824" y="122" text-anchor="middle" class="t-title-hi">vpn endpoint</text>
+    <text x="824" y="139" text-anchor="middle" class="t-sub-hi">udp/51820</text>
+    <text x="824" y="153" text-anchor="middle" class="t-sub-hi">per-source limit</text>
+    <text x="824" y="167" text-anchor="middle" class="t-sub-hi">only public accept</text>
+    <text x="824" y="196" text-anchor="middle" class="t-file">50-vpn-endpoint.nft</text>
+  </g>
+  <path class="arrow" d="M888,150 L912,150"/>
+
+  <!-- stage 6: icmp -->
+  <g>
+    <rect x="606" y="210" width="128" height="64" rx="10" class="stage"/>
+    <text x="670" y="230" text-anchor="middle" class="t-title" font-size="12">icmp (public)</text>
+    <text x="670" y="246" text-anchor="middle" class="t-sub">PMTUD, NDP</text>
+    <text x="670" y="264" text-anchor="middle" class="t-file">60-icmp.nft</text>
+  </g>
+  <path class="arrow" d="M690,190 C700,198 690,205 680,210"/>
+
+  <!-- catch-all drop at the end -->
+  <g>
+    <rect x="914" y="118" width="106" height="64" rx="10" class="stage-deny"/>
+    <text x="967" y="144" text-anchor="middle" class="t-title" fill="#ffa198">catch-all</text>
+    <text x="967" y="160" text-anchor="middle" class="t-bad">log + drop</text>
+  </g>
+  <text x="967" y="196" text-anchor="middle" class="t-file">70-logging.nft</text>
+</svg>

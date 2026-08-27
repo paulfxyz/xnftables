@@ -86,6 +86,8 @@ This feels uncomfortable the first time. It shouldn't. The alternative — "allo
 
 We trust the `wg0` interface at the network layer. A packet that arrived on `wg0` has already been cryptographically authenticated. We then perform a second check — source IP must be in the mesh CIDR — as defence-in-depth against misconfigured `AllowedIPs`.
 
+<p align="center"><img src="docs/assets/topology.svg" alt="xnftables topology: the public interface drops everything except WireGuard, valid peers decrypt into the mesh, the mesh trust boundary gates access to the services chain" width="100%"></p>
+
 ### Explicit, named, auditable
 
 Every rule carries a `comment` field. `nft list ruleset` shows them. Rules without comments are rejected in PR review.
@@ -124,6 +126,10 @@ The include order matters. Loopback is accepted first (127.0.0.0/8 is in `BOGON_
 ---
 
 ## Packet flow
+
+<p align="center"><img src="docs/assets/packet-flow.svg" alt="xnftables packet flow: loopback, antiscan, mesh trust boundary, established, vpn endpoint, icmp, catch-all" width="100%"></p>
+
+The diagram above is the quick-reference version. The exact rule order, with every verdict spelled out, lives in the ASCII trace below — this is what you grep when debugging:
 
 ```
 Incoming packet
