@@ -1,5 +1,7 @@
 # ⛫ xnftables
 
+<p align="center"><img src="docs/assets/hero.svg" alt="xnftables: a deny-all rampart around the public interface, with a single deliberate gate (WireGuard, udp/51820) into a trusted mesh" width="100%"></p>
+
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
 [![nftables](https://img.shields.io/badge/nftables-%E2%89%A50.9.3-orange?logo=linux&logoColor=white)](https://wiki.nftables.org/)
 [![WireGuard](https://img.shields.io/badge/WireGuard-mesh--or--nothing-88171A?logo=wireguard&logoColor=white)](https://www.wireguard.com/)

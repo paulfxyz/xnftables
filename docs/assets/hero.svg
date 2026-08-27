@@ -1,0 +1,111 @@
+<svg viewBox="0 0 1200 300" xmlns="http://www.w3.org/2000/svg">
+  <defs>
+    <radialGradient id="bgGlow" cx="50%" cy="45%" r="65%">
+      <stop offset="0%" stop-color="#0d2818"/>
+      <stop offset="45%" stop-color="#0d1117"/>
+      <stop offset="100%" stop-color="#010409"/>
+    </radialGradient>
+    <linearGradient id="meshGlow" x1="0%" y1="0%" x2="100%" y2="100%">
+      <stop offset="0%" stop-color="#3fb950"/>
+      <stop offset="100%" stop-color="#56d364"/>
+    </linearGradient>
+    <radialGradient id="coreGlow" cx="50%" cy="50%" r="50%">
+      <stop offset="0%" stop-color="#7ee787" stop-opacity="0.9"/>
+      <stop offset="100%" stop-color="#7ee787" stop-opacity="0"/>
+    </radialGradient>
+    <filter id="soft" x="-50%" y="-50%" width="200%" height="200%">
+      <feGaussianBlur stdDeviation="6"/>
+    </filter>
+    <pattern id="grid" width="28" height="28" patternUnits="userSpaceOnUse">
+      <path d="M0,28 L0,0 L28,0" fill="none" stroke="#30363d" stroke-width="0.6" opacity="0.5"/>
+    </pattern>
+  </defs>
+
+  <!-- background -->
+  <rect width="1200" height="300" fill="url(#bgGlow)"/>
+  <rect width="1200" height="300" fill="url(#grid)"/>
+
+  <!-- starfield / packet dots getting dropped, scattered outside the wall -->
+  <g fill="#f85149" opacity="0.55">
+    <circle cx="70" cy="60" r="2"/>
+    <circle cx="130" cy="120" r="1.6"/>
+    <circle cx="45" cy="190" r="2"/>
+    <circle cx="160" cy="70" r="1.4"/>
+    <circle cx="95" cy="230" r="1.8"/>
+    <circle cx="200" cy="180" r="1.5"/>
+    <circle cx="1060" cy="55" r="2"/>
+    <circle cx="1120" cy="130" r="1.6"/>
+    <circle cx="1000" cy="210" r="1.8"/>
+    <circle cx="1145" cy="230" r="1.4"/>
+    <circle cx="1080" cy="170" r="1.5"/>
+  </g>
+
+  <!-- outer deny-all wall (crenellated / castle rampart, matching the site's title glyph) -->
+  <g fill="none" stroke="#f85149" stroke-width="2" opacity="0.85">
+    <path d="M240,150
+             L240,110 L262,110 L262,130 L284,130 L284,110 L306,110 L306,130 L328,130 L328,110 L350,110 L350,150" />
+    <path d="M850,150
+             L850,110 L872,110 L872,130 L894,130 L894,110 L916,110 L916,130 L938,130 L938,110 L960,110 L960,150" />
+  </g>
+  <!-- side rampart walls trailing off -->
+  <path d="M240,150 C 170,155 110,158 20,158" fill="none" stroke="#f85149" stroke-width="2" opacity="0.55" stroke-dasharray="1 0"/>
+  <path d="M960,150 C 1030,155 1090,158 1180,158" fill="none" stroke="#f85149" stroke-width="2" opacity="0.55"/>
+
+  <!-- ramparts base line -->
+  <line x1="240" y1="150" x2="960" y2="150" stroke="#f85149" stroke-width="2" opacity="0.85"/>
+
+  <!-- dropped packets hitting the wall -->
+  <g stroke="#f85149" stroke-width="1.6" stroke-dasharray="3 3" opacity="0.7" fill="none">
+    <path d="M60,70 C130,90 190,120 236,138"/>
+    <path d="M60,220 C130,200 190,170 236,152"/>
+    <path d="M1140,80 C1070,100 1010,125 964,140"/>
+    <path d="M1140,220 C1070,195 1010,168 964,152"/>
+  </g>
+  <g fill="#f85149" opacity="0.9">
+    <circle cx="236" cy="138" r="3"/>
+    <circle cx="236" cy="152" r="3"/>
+    <circle cx="964" cy="140" r="3"/>
+    <circle cx="964" cy="152" r="3"/>
+  </g>
+
+  <!-- glowing mesh core inside the walls -->
+  <circle cx="600" cy="150" r="150" fill="url(#coreGlow)" filter="url(#soft)"/>
+
+  <!-- mesh lattice: nodes + connecting lines, glowing green, inside the wall -->
+  <g stroke="url(#meshGlow)" stroke-width="1.3" opacity="0.85" fill="none">
+    <line x1="600" y1="150" x2="500" y2="90"/>
+    <line x1="600" y1="150" x2="705" y2="95"/>
+    <line x1="600" y1="150" x2="720" y2="205"/>
+    <line x1="600" y1="150" x2="495" y2="210"/>
+    <line x1="600" y1="150" x2="600" y2="70"/>
+    <line x1="500" y1="90" x2="600" y2="70"/>
+    <line x1="705" y1="95" x2="600" y2="70"/>
+    <line x1="495" y1="210" x2="720" y2="205"/>
+    <line x1="500" y1="90" x2="420" y2="150"/>
+    <line x1="705" y1="95" x2="780" y2="150"/>
+    <line x1="495" y1="210" x2="420" y2="150"/>
+    <line x1="720" y1="205" x2="780" y2="150"/>
+  </g>
+  <g fill="#7ee787">
+    <circle cx="600" cy="150" r="6"/>
+    <circle cx="500" cy="90" r="4"/>
+    <circle cx="705" cy="95" r="4"/>
+    <circle cx="720" cy="205" r="4"/>
+    <circle cx="495" cy="210" r="4"/>
+    <circle cx="600" cy="70" r="4"/>
+    <circle cx="420" cy="150" r="4"/>
+    <circle cx="780" cy="150" r="4"/>
+  </g>
+
+  <!-- lock glyph at the gate (bottom center of the wall, the one deliberate exception: WireGuard) -->
+  <g transform="translate(600,150)">
+    <rect x="-14" y="-2" width="28" height="22" rx="4" fill="#0d1117" stroke="#7ee787" stroke-width="2"/>
+    <path d="M-8,-2 L-8,-10 C-8,-19 8,-19 8,-10 L8,-2" fill="none" stroke="#7ee787" stroke-width="2.5"/>
+    <circle cx="0" cy="9" r="2.6" fill="#7ee787"/>
+  </g>
+  <text x="600" y="196" text-anchor="middle" font-family="Menlo,Consolas,'Courier New',monospace" font-size="11" fill="#7ee787" opacity="0.9">udp/51820</text>
+
+  <!-- caption -->
+  <text x="600" y="255" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="15" fill="#c9d1d9" font-weight="600">If you are not inside the mesh, you see nothing.</text>
+  <text x="600" y="277" text-anchor="middle" font-family="-apple-system,Segoe UI,Helvetica,Arial,sans-serif" font-size="12" fill="#8b949e">deny-all defaults · nftables + WireGuard · least privilege at the network layer</text>
+</svg>
