@@ -43,6 +43,8 @@
 - [Security model](#security-model)
 - [Known bugs fixed in v2](#known-bugs-fixed-in-v2)
 - [Known bugs fixed in v3](#known-bugs-fixed-in-v3-the-5-model-audit)
+- [Known bugs fixed in v4](#known-bugs-fixed-in-v4-the-second-5-model-audit)
+- [Roadmap](#roadmap)
 - [nftables primer](#nftables-primer)
 - [Why nftables over iptables](#why-nftables-over-iptables)
 - [Why WireGuard over OpenVPN / IPsec](#why-wireguard-over-openvpn--ipsec)
@@ -1216,6 +1218,27 @@ since some distro/cloud images still flip it back to `1` for legacy NAT
 appliances. See the [kernel conntrack-sysctl
 docs](https://www.kernel.org/doc/html/latest/networking/nf_conntrack-sysctl.rst)
 for the full helper list and semantics.
+
+---
+
+## Roadmap
+
+### Done in v4.0.0
+
+- [x] Rate-limited every attacker-reachable `ct state invalid` log (public input/output, mesh, forward chain) so a bare packet-scan flood can no longer force an uncapped kernel log write ([v4-01](#bug-v4-01--four-unrate-limited-ct-state-invalid-logs-public-reachable-dos)).
+- [x] Moved break-glass SSH behind the wg0 anti-spoof drop and scoped it to the public interface, closing a path where a spoofed wg0 packet could reach it before the anti-spoof check ran ([v4-02](#bug-v4-02--break-glass-ssh-could-bypass-the-mesh-anti-spoof-check)).
+- [x] Replaced break-glass SSH's single shared rate-limit bucket with a per-source meter, so a spoofed flood "from" the (non-secret) admin IP can no longer weld the emergency door shut ([v4-03](#bug-v4-03--break-glass-ssh-rate-limit-was-a-single-global-bucket)).
+- [x] Narrowed the conntrack `related` fast-path to ICMP/ICMPv6 errors only, closing a conntrack-helper-shaped hole that could accept an attacker-chosen inbound port on legacy kernel configs, and documented disabling `nf_conntrack_helper` at the kernel level ([v4-04](#bug-v4-04--ct-state-related-accepted-more-than-icmp-errors-conntrack-helper-hole--icmp-dead-code)).
+- [x] Fixed `reload.sh --confirm-timeout` reporting false success when stdin isn't a TTY (cron/CI/automation), and added a Ctrl-C trap during the confirm window so an interrupt reverts instead of leaving an unreviewed ruleset live ([v4-05](#bug-v4-05--reloadsh---confirm-timeout-misreported-success-from-non-interactive-stdin)).
+- [x] Fixed `check.sh` silently reporting a clean pass when run without root — exactly how it's installed as a pre-commit hook — despite performing zero real checks ([v4-06](#bug-v4-06--checksh-reported-a-clean-pass-after-checking-nothing)).
+- [x] Strengthened (not changed) the hub-routing template and egress-ICMP documentation so both known trade-offs are explicit rather than silently discovered.
+
+### Next up
+
+- [ ] IPv6 and rate-limiter regression coverage in `tests/run-tests.sh` — flagged independently by all five v4 audit models, deferred because writing new namespace-harness probe rules without a working `nft` binary to validate against risks shipping test code that was never actually executed.
+- [ ] Optional `table inet raw` prerouting exemption for the WireGuard handshake port (see ["Early invalid-drop at raw priority"](#early-invalid-drop-at-raw-priority-performance)) to avoid a conntrack entry per handshake packet — kept out of the shipped single-table design pending its own audit pass.
+- [ ] Per-service allowlist for the commented hub-routing forward template, for anyone running a mesh hub who wants least-privilege between peers rather than full mesh-to-mesh trust.
+- [ ] Third-party review of the v4.0.0 fixes beyond CI's automated suite — CI validates syntax and the 29-case enforcement suite, but hasn't had independent human or model review since the audit that produced them.
 
 ---
 
