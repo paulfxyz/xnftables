@@ -11,6 +11,8 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/paulfxyz/xnftables/pulls)
 [![Deny All](https://img.shields.io/badge/default%20policy-DROP-critical)](https://github.com/paulfxyz/xnftables)
 
+**[→ Take the choice — live landing page](https://www.perplexity.ai/computer/a/xnftables-pqAazk_WTYSAH.GY8GLplg)**
+
 ---
 
 > **If you are not inside the mesh, you see nothing.**
@@ -510,6 +512,8 @@ The same suite runs in CI on every push (ubuntu-24.04, real kernel, real nftable
 ---
 
 ## Security model
+
+<p align="center"><img src="docs/assets/shield.svg" alt="Layered security model: perimeter policy drop, then per-threat mitigations for scans, floods, and spoofing, with compromised-peer and application-layer risk explicitly marked out of scope" width="100%"></p>
 
 ### What this policy protects against
 
