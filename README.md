@@ -710,6 +710,59 @@ The v2 BUG 9A "fix" added `ct established accept` to the forward chain but no `c
 
 ---
 
+## Known bugs fixed in v4 (the second 5-model audit)
+
+For v4, the ruleset and tooling were independently audited by five frontier AI models a second time — not the website, the actual `.nft` policy and shell scripts. Findings were cross-checked line-by-line against the real files in this repo before any fix was written. Unlike v3, no critical inbound mesh-bypass was found under default configuration by any of the five models: the core "if you are not inside the mesh, you see nothing" guarantee held. Findings concentrated on safety-mechanism reliability, attacker-reachable logging as a DoS vector, and tooling honesty (a script silently reporting success when it hadn't actually done anything).
+
+### BUG v4-01 — four unrate-limited `ct state invalid` logs (public-reachable DoS)
+
+`ct state invalid` matches ordinary port-scan noise (bare ACK/RST, overlapping reassembly) that ANY public source can trigger at will — and the log line in `30-established.nft` (input *and* output chains), `20-mesh.nft`, and `70-logging.nft`'s forward chain had no rate limit. An attacker sending a plain stream of invalid-state packets got an uncapped kernel log write per packet: free disk-fill, journald CPU burn, or log-blinding (drowning real signal in noise) for the cost of their own bandwidth — in direct violation of this project's own stated invariant that every attacker-triggerable log is rate-limited in a separate rule ahead of an unconditional drop.
+
+**Fix:** all four log rules split into a rate-limited log (`limit rate 10/second burst 20`) plus an unconditional `counter drop`, so the log's own rate limit can never gate the drop.
+
+### BUG v4-02 — break-glass SSH could bypass the mesh anti-spoof check
+
+The `ADMIN_ALLOWLIST` break-glass SSH rule sat in the `input` chain *before* the wg0 spoof-drop pairs and carried no `iifname` qualifier. A packet arriving directly on `wg0` with a source address inside `@ADMIN_ALLOWLIST` and destination port 22 matched the break-glass accept before the anti-spoof check (BUG 1A's own protection) ever ran — exactly the "WireGuard `AllowedIPs` misconfigured more broadly than the mesh CIDR" scenario 1A exists to catch, defeated for the one port an attacker most wants. It also skipped the SSH connection meter in `40-services.nft` entirely (different chain, different meter).
+
+**Fix:** break-glass now sits *after* both the IPv4 and IPv6 spoof-drop pairs and is qualified `iifname != "wg0"` — it only ever answers on the public interface, matching its documented purpose ("fires when WireGuard is down").
+
+### BUG v4-03 — break-glass SSH rate limit was a single global bucket
+
+`limit rate 10/minute` on the break-glass rule is one shared token bucket despite the comment claiming per-source — the same bug class already fixed for the WireGuard endpoint (BUG 3A) and the mesh SSH service (BUG v3-09), missed here. Worse than those two: the accept only needs a bare SYN to consume a token, and TCP source addresses are spoofable for a SYN. The break-glass IP is not a secret — it's in git history, in `nft list ruleset` output, in the set dump — so an attacker sending spoofed SYNs "from" that address at 1 pps permanently drains the shared bucket and welds the emergency door shut, on the one path you use when WireGuard is already down.
+
+**Fix:** replaced the bare `limit rate` with a per-source `meter` (`breakglass_rl`, 60s timeout, matching the `ssh_rl` pattern in `40-services.nft`) so only the offending source is ever rate-limited.
+
+### BUG v4-04 — `ct state related` accepted more than ICMP errors (conntrack-helper hole + ICMP dead code)
+
+`related` is not just "ICMP error for my flow" — it is any packet matching a conntrack *helper* expectation (`nf_conntrack_ftp`/`_sip`/`_h323`/`_tftp`/`_irc`/`_pptp`/`_amanda`). On a kernel with `net.netfilter.nf_conntrack_helper=1` (the old default; still set on some distro/cloud images), one outbound connection a helper latches onto could create an expectation, and the old unconditional `ct state { established, related } accept` would then accept an inbound packet on a port of the attacker's choosing — before any service allowlist, before `50-vpn-endpoint.nft`, before the catch-all drop. Because `30-established.nft` is included *before* `60-icmp.nft` and its `established` branch accepted first, this also made every ICMP hardening rule in `60-icmp.nft` dead code for `related`-classified ICMP errors.
+
+**Fix:** `established` is still accepted unconditionally (the flow was already vetted once); `related` is now narrowed to `meta l4proto { icmp, icmpv6 } ct state related`, rate-limited. A helper expectation no longer matches either rule and falls through to the catch-all — logged and dropped. **You must also set `net.netfilter.nf_conntrack_helper = 0`** (see [Why `nf_conntrack_helper` must be disabled](#why-nf_conntrack_helper-must-be-disabled) above) — this rule closes the accept-side hole but the helper module can still attach the expectation in the first place unless disabled at the kernel level.
+
+### BUG v4-05 — `reload.sh --confirm-timeout` misreported success from non-interactive stdin
+
+`read -r -t N` returns immediately — not after N seconds — when stdin is closed or not a TTY (cron, Ansible, CI, or any invocation with stdin redirected from `/dev/null`). The script could not distinguish that from "a human was asked and didn't answer": both took the identical silent-rollback branch and `exit 0`. An automation pipeline using `--confirm-timeout` would see "Not confirmed" and a *success* exit code despite the new ruleset never having been kept — precisely the false-positive failure mode this project exists to prevent elsewhere. A `Ctrl-C` during the confirm window was also uncaught, exiting mid-script with `set -e` armed and no rollback at all.
+
+**Fix:** non-TTY stdin is detected before the prompt and fails loudly with a distinct exit code (`2`) after reverting, instead of silently returning success (`0`). `SIGINT`/`SIGTERM` during the confirm window now trigger the same rollback path as a timeout, with the trap cleared once the window closes.
+
+### BUG v4-06 — `check.sh` reported a clean pass after checking nothing
+
+When run without root (exactly how a developer runs a pre-commit hook — the script's own installation instructions say `cp scripts/check.sh .git/hooks/pre-commit`), the script performed zero checks, printed `Results: 0 passed, 0 failed`, and exited `0` — identical output shape to a genuine all-green run. Every commit from a non-root dev account silently skipped syntax validation while the hook still reported success.
+
+**Fix:** a run that skipped the only real check because it lacks root now exits `2` (distinct from the `1` used for actual failures) with an explicit "not a verified pass" note, so hooks and scripts can tell "never actually checked" apart from "checked and clean." CI is unaffected — the workflow calls `sudo nft -c -f` directly, not this script.
+
+### Documented, not changed
+
+- **WireGuard handshake port conntrack cost (`50-vpn-endpoint.nft`)**: the per-source meter on UDP/51820 rate-limits by source IP/`/64`, but Linux conntrack keys on the full 5-tuple including the attacker-controlled source port — a flood that varies the source port still creates a fresh conntrack entry per packet even while correctly throttled, a cheap path toward `nf_conntrack_max` exhaustion. The textbook fix is `notrack`, but `notrack` only takes effect in a `raw` table evaluated at `hook priority raw` (before conntrack runs) — this ruleset is intentionally a single `inet filter` table at the default `filter` priority, so a bare `notrack` statement in that table silently does nothing. Adding a second table/hook is a real structural change to a design that has been through two audits as single-table, so it stays out of the shipped ruleset; the existing ["Early invalid-drop at raw priority"](#early-invalid-drop-at-raw-priority-performance) pattern below already shows the correct `table inet raw` shape (its commented `notrack` line targets this exact port) for anyone who wants to opt in.
+- **Hub-routing template scope (`70-logging.nft`)**: the commented mesh-to-mesh forwarding template grants unrestricted peer-to-peer access between every `@MESH_PEERS` member once uncommented, with no per-service allowlist equivalent to `40-services.nft`. This is a deliberate scope decision for an opt-in feature (a small mesh's members trusting each other is reasonable), not a bug — the comment now says so explicitly and points at where to add a per-service allowlist if your threat model needs it.
+- **Egress ICMP / output policy accept**: `00-tables.nft` already documents `policy accept` on output as an explicit, opt-out trust decision with a stated path to zero-trust egress. The v4 audit's observation that a down WireGuard listener can leak an ICMP port-unreachable is a natural consequence of that already-documented choice, not new behavior.
+- **Test suite gaps (IPv6, rate-limiter regression tests)**: the enforcement suite (`tests/run-tests.sh`) still has no IPv6 or rate-limit-specific test cases, flagged independently by all five models. Adding them correctly requires wiring new probe rules into the namespace-based harness (`tests/lib.sh`) and iterating against a real `nft` binary to confirm they pass/fail correctly — not done in this pass, to avoid shipping test code that was never actually executed. Tracked as follow-up work.
+
+### A note on verification
+
+Every v4 fix above was written and reasoned through against the real rule files, but **could not be executed against a live `nft` binary in the environment these changes were made in** — that sandbox's kernel has no `nf_tables` netlink support at all (`nft add table` fails with "Operation not supported" even as root). Syntax correctness and behavior were verified by manual trace against the existing, working rule patterns elsewhere in this same file (the log/drop split, the per-source meter shape, the `iifname` qualification style) rather than by `nft -c` or the namespace test suite. **This repo's CI (`sudo nft -c -f` + the full network-namespace enforcement suite on real Ubuntu 24.04 runners) is the actual verification gate** — treat these fixes as verified once CI is green on the pushed commit, not before.
+
+---
+
 ## nftables primer
 
 ### Tables and chains
@@ -1133,6 +1186,39 @@ Run via `PostUp` in `wg0.conf` or a systemd timer.
 
 ---
 
+## Why `nf_conntrack_helper` must be disabled
+
+`rules/30-established.nft` accepts `ct state established` unconditionally and
+`ct state related` only for ICMP/ICMPv6 errors on a tracked flow — that is
+the entire trust boundary for "a reply belongs to a connection I opened".
+
+But `related` is a broader kernel classification than "ICMP error for my
+flow". If the deprecated automatic conntrack helpers are loaded
+(`nf_conntrack_ftp`, `_sip`, `_h323`, `_tftp`, `_irc`, `_pptp`, `_amanda`),
+any one of them can attach an *expectation* to a tracked connection, and the
+kernel then classifies a completely different inbound packet — on a port and
+from a source of the helper's (or an attacker's) choosing — as `related` to
+it. Before this project's v4 hardening pass, that meant a single outbound FTP
+or SIP connection could open an inbound hole that bypassed every service
+allowlist in `40-services.nft`. The nftables rules now only ever treat
+ICMP/ICMPv6 as legitimately `related`, which closes the *accept* side of
+that hole from this ruleset's perspective — but the helper modules can still
+attach the expectation in the first place unless disabled at the kernel
+level. Set it once, persistently:
+
+```bash
+# /etc/sysctl.d/99-xnftables.conf
+net.netfilter.nf_conntrack_helper = 0
+```
+
+Modern kernels (≥ 4.5) already default this to `0` — pin it explicitly anyway,
+since some distro/cloud images still flip it back to `1` for legacy NAT
+appliances. See the [kernel conntrack-sysctl
+docs](https://www.kernel.org/doc/html/latest/networking/nf_conntrack-sysctl.rst)
+for the full helper list and semantics.
+
+---
+
 ## Hardening checklist
 
 ```
@@ -1166,6 +1252,7 @@ Kernel settings (complement to nftables rules)
 [ ] net.ipv4.conf.all.log_martians = 1  (kernel martian logging as second opinion)
 [ ] net.ipv4.conf.all.accept_redirects = 0  (no ICMP redirects)
 [ ] net.ipv6.conf.all.accept_redirects = 0
+[ ] net.netfilter.nf_conntrack_helper = 0  (REQUIRED, v4 hardening — see below)
 
 Logging
 [ ] Log shipping configured (rsyslog/journald → SIEM or Loki)
