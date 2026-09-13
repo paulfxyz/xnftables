@@ -1,5 +1,9 @@
 # ⛫ xnftables
 
+<p align="center">
+  <img src="docs/assets/morpheus-hero.png" alt="A choice between two pills: one red, one blue. xnftables asks the same question of your network — see everything, or see nothing outside the mesh." width="340">
+</p>
+
 <p align="center"><img src="docs/assets/hero.svg" alt="xnftables: a deny-all rampart around the public interface, with a single deliberate gate (WireGuard, udp/51820) into a trusted mesh" width="100%"></p>
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
@@ -11,7 +15,7 @@
 [![PRs Welcome](https://img.shields.io/badge/PRs-welcome-brightgreen.svg)](https://github.com/paulfxyz/xnftables/pulls)
 [![Deny All](https://img.shields.io/badge/default%20policy-DROP-critical)](https://github.com/paulfxyz/xnftables)
 
-**[→ Take the choice — live landing page](https://www.perplexity.ai/computer/a/xnftables-pqAazk_WTYSAH.GY8GLplg)**
+**[→ Take the choice — live landing page](https://xnftables.net/)**
 
 ---
 
