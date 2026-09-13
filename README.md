@@ -6,7 +6,7 @@
 
 <p align="center"><img src="docs/assets/hero.svg" alt="xnftables: a deny-all rampart around the public interface, with a single deliberate gate (WireGuard, udp/51820) into a trusted mesh" width="100%"></p>
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](https://opensource.org/licenses/MIT)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](./LICENSE)
 [![nftables](https://img.shields.io/badge/nftables-%E2%89%A50.9.3-orange?logo=linux&logoColor=white)](https://wiki.nftables.org/)
 [![WireGuard](https://img.shields.io/badge/WireGuard-mesh--or--nothing-88171A?logo=wireguard&logoColor=white)](https://www.wireguard.com/)
 [![Kernel](https://img.shields.io/badge/Linux%20kernel-%E2%89%A55.6-informational?logo=linux&logoColor=white)](https://www.kernel.org/)
@@ -1217,5 +1217,5 @@ Any mainstream distro meeting those minimums (Debian 12+, Ubuntu 22.04+, Arch, F
 
 ## License
 
-MIT — use it, adapt it, share it.
+[MIT](./LICENSE) — use it, adapt it, share it.
 If you improve it, send a PR.
