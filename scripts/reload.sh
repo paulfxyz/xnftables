@@ -157,14 +157,49 @@ nft list chains | grep -E "chain|hook" | sed 's/^/    /'
 # If the new rules cut your SSH session, you cannot type "keep" — the read
 # times out (or stdin closes) and the previous ruleset is restored in this
 # same process.  Reconnect and investigate.
+#
+# BUG FIX (v4-05) — non-interactive stdin masqueraded as a real timeout:
+#   "read -r -t N" returns non-zero IMMEDIATELY (not after N seconds) when
+#   stdin is closed or not a TTY — e.g. invoked from cron, an Ansible
+#   playbook, a CI runner, or any "sudo ./reload.sh --confirm-timeout 60"
+#   launched with stdin redirected from /dev/null.  The old code could not
+#   tell that apart from "the user was asked and didn't answer": both took
+#   the same silent-rollback branch, exit 0. An automation pipeline calling
+#   this with --confirm-timeout would see reload.sh print "Not confirmed"
+#   and exit 0 (success) despite the new ruleset never having been kept —
+#   the exact "looks fine, isn't" failure mode this project's audit trail
+#   exists to prevent. It also meant --confirm-timeout was silently useless
+#   from any automation context, which is precisely where remote-safe
+#   testing is needed most.
+#   Fix: detect non-TTY stdin up front and fail loudly with a DISTINCT exit
+#   code (2) instead of the misleading "revert" exit 0, so a caller can tell
+#   "never asked, ruleset already reverted" apart from "was asked, silence
+#   triggered a real timeout revert" (still exit 0 — that path is correct).
 if $AUTO_REVERT; then
+  if [[ ! -t 0 ]]; then
+    echo "" >&2
+    echo "ERROR: --confirm-timeout requires an interactive TTY on stdin." >&2
+    echo "       stdin is closed or redirected — cannot prompt for 'keep'," >&2
+    echo "       and applying it here would misreport rollback as success." >&2
+    echo "       Reverting to the previous ruleset now." >&2
+    rollback
+    exit 2
+  fi
   echo ""
   echo "==> CONFIRM REQUIRED: type 'keep' + Enter within ${CONFIRM_TIMEOUT}s"
   echo "    to keep the new rules. Anything else (or silence) reverts."
+  # BUG FIX (v4-05b): a Ctrl-C (SIGINT) during this window previously killed
+  # the script mid-read with "set -e" still armed and NO rollback — leaving
+  # the new (possibly session-killing) ruleset active with nobody watching.
+  # Trap INT/TERM here and revert exactly like a timeout would, then restore
+  # default handling once we leave the confirm window.
+  trap 'echo ""; echo "==> Interrupted — reverting."; rollback; exit 130' INT TERM
   answer=""
   if read -r -t "$CONFIRM_TIMEOUT" answer && [[ $answer == "keep" ]]; then
+    trap - INT TERM
     echo "==> Confirmed — new ruleset kept."
   else
+    trap - INT TERM
     echo ""
     echo "==> Not confirmed within ${CONFIRM_TIMEOUT}s."
     rollback

@@ -33,6 +33,7 @@ echo ""
 # Full-ruleset dry-run is the most important check.
 # Requires running as root (nft -c touches kernel interfaces).
 CONF="$(dirname "$0")/../nftables.conf"
+SKIPPED_ROOT_CHECK=false
 if [[ -f "$CONF" ]]; then
   if [[ $EUID -eq 0 ]]; then
     echo "--- Full ruleset (nftables.conf) ---"
@@ -47,6 +48,7 @@ if [[ -f "$CONF" ]]; then
   else
     echo "--- Skipping full ruleset check (requires root) ---"
     echo "    Run: sudo ./scripts/check.sh for complete validation"
+    SKIPPED_ROOT_CHECK=true
   fi
 fi
 
@@ -60,6 +62,23 @@ if [[ ${#ERRORS[@]} -gt 0 ]]; then
     echo "  - $f"
   done
   exit 1
+fi
+
+# BUG FIX (v4-06) — vacuous pass masqueraded as success:
+#   When not run as root, the script performed ZERO checks (PASS=0, FAIL=0),
+#   printed "Results: 0 passed, 0 failed", and exited 0 — identical to a
+#   real all-green run. Installed as ".git/hooks/pre-commit" per this
+#   script's own header instructions, every commit from a non-root dev
+#   account silently skipped syntax validation entirely while still showing
+#   a passing hook, and CI would only catch it if the runner happened to be
+#   root. Fix: a run that skipped the only real check because it lacks root
+#   is NOT a pass — exit 2 (distinct from the FAIL=1 exit code) so hooks/CI
+#   treat "never actually checked" differently from "checked and clean".
+if $SKIPPED_ROOT_CHECK && [[ ${#ERRORS[@]} -eq 0 ]]; then
+  echo ""
+  echo "NOTE: no syntax check actually ran (needs root) — not a verified pass."
+  echo "      Re-run with sudo, or rely on CI's root-privileged run."
+  exit 2
 fi
 
 exit 0
