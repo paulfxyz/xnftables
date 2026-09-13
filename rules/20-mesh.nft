@@ -23,7 +23,16 @@
 #   The spoof check MUST come BEFORE the unconditional jump to mesh_input.
 #   If the jump fires first, control never returns to the input chain for
 #   wg0 packets — the spoof rule becomes unreachable dead code.
-#   Rule order: spoof-drop → jump → (mesh_input handles everything else)
+#   Rule order: spoof-drop -> break-glass (non-wg0 only) -> jump ->
+#   (mesh_input handles everything else)
+#
+# BUG FIX (v4-02) — break-glass no longer jumps the anti-spoof queue:
+#   v3 placed the ADMIN_ALLOWLIST break-glass SSH rules BEFORE the spoof-drop
+#   pairs and with no interface qualifier, so a spoofed/misrouted wg0 packet
+#   matching ADMIN_ALLOWLIST + dport 22 was accepted before the anti-spoof
+#   check ever ran.  Break-glass now sits AFTER both spoof-drop pairs and is
+#   qualified "iifname != wg0" — it only ever answers on the public
+#   interface, exactly as intended ("fires when WireGuard is down").
 #
 # Topology assumed:
 #   WireGuard interface : wg0
@@ -45,32 +54,6 @@
 
 table inet filter {
     chain input {
-
-        # --- Break-glass emergency SSH (ADMIN_ALLOWLIST, pre-wg0 jump) ---
-        # This MUST be here — in the input chain, before the wg0 jump.
-        # It cannot live in the services chain (which is only reached via
-        # wg0) because it needs to fire when WireGuard is DOWN.
-        # Populated only if ADMIN_ALLOWLIST has entries (00-tables.nft).
-        # Rate-limited: 10 new connections/minute per source (brute-force guard).
-        ip saddr @ADMIN_ALLOWLIST \
-            tcp dport 22 \
-            ct state new \
-            limit rate 10/minute \
-            accept comment "break-glass: emergency SSH (ADMIN_ALLOWLIST, public iface)"
-
-        # Log excessive break-glass attempts (possible brute-force on the
-        # emergency back-door).  Log and drop are SPLIT so the log's own rate
-        # limit can never gate the drop (see 10-antiscan.nft header).
-        ip saddr @ADMIN_ALLOWLIST \
-            tcp dport 22 \
-            ct state new \
-            limit rate 6/minute burst 10 packets \
-            log prefix "XNFT-BREAKGLASS-RATELIMIT: " level warn \
-            comment "break-glass: log rate-limit excess (rate-limited)"
-        ip saddr @ADMIN_ALLOWLIST \
-            tcp dport 22 \
-            ct state new \
-            counter drop comment "break-glass: rate-limit exceeded"
 
         # --- Anti-spoof: drop wg0 packets with non-mesh source IP FIRST ---
         # BUG FIX (1A): This must precede the unconditional jump below.
@@ -98,6 +81,47 @@ table inet filter {
         iifname "wg0" ip6 saddr != @MESH_PEERS6 \
             counter drop comment "mesh: spoofed IPv6 source inside wg0 tunnel"
 
+        # --- Break-glass emergency SSH (ADMIN_ALLOWLIST, post-spoof-drop) ---
+        # This MUST be here in the input chain — not the services chain,
+        # which is only reached via wg0 — because it needs to fire when
+        # WireGuard is DOWN.  Populated only if ADMIN_ALLOWLIST has entries
+        # (00-tables.nft).
+        #
+        # BUG FIX (v4-02) — break-glass bypassed the mesh anti-spoof check:
+        #   v3 placed these three rules BEFORE the spoof-drop pairs above and
+        #   with no "iifname" qualifier.  A packet arriving ON wg0 itself with
+        #   a source address inside @ADMIN_ALLOWLIST and dport 22 was accepted
+        #   by the old rule 1 before the anti-spoof check ever ran — exactly
+        #   the "WireGuard AllowedIPs misconfigured more broadly than the mesh
+        #   CIDR" case BUG 1A exists to catch, defeated for the one port an
+        #   attacker most wants.  It also let such a packet skip the per-source
+        #   SSH meter in 40-services.nft entirely (different chain, different
+        #   meter).  Fix: qualify to the non-mesh path and move the three
+        #   rules below both spoof-drop pairs, so a wg0 packet always hits the
+        #   spoof check first regardless of its source address.
+        #
+        # BUG FIX (v4-03) — global (not per-source) rate limit:
+        #   "limit rate 10/minute" is a single shared token bucket despite the
+        #   comment claiming "per source" — the same bug class already fixed
+        #   as BUG 3A (50-vpn-endpoint.nft) and BUG v3-09 (40-services.nft) but
+        #   missed here.  Worse than those two: the accept only needs a SYN to
+        #   consume a token, and TCP source addresses are spoofable for a SYN.
+        #   The break-glass IP is not a secret (it is in git history, in the
+        #   set dump, in "nft list ruleset" output) — an attacker sending 1 pps
+        #   of spoofed SYNs "from" that address permanently drains the shared
+        #   bucket and welds the emergency door shut, on the one path you use
+        #   when WireGuard is already down.  Fix: give each source its own
+        #   bucket via a meter, matching the ssh_rl pattern in 40-services.nft.
+        iifname != "wg0" ip saddr @ADMIN_ALLOWLIST \
+            tcp dport 22 \
+            ct state new \
+            meter breakglass_rl size 1024 { ip saddr timeout 60s limit rate over 10/minute } \
+            jump breakglass_ratelimit_drop comment "break-glass: per-source rate-limit (IPv4)"
+        iifname != "wg0" ip saddr @ADMIN_ALLOWLIST \
+            tcp dport 22 \
+            ct state new \
+            accept comment "break-glass: emergency SSH (ADMIN_ALLOWLIST, public iface)"
+
         # --- WireGuard tunnel: jump to per-service allowlist ---
         # Only reached after the spoof check above passes.
         # We use "jump" (not "goto") so if mesh_input returns without a
@@ -113,9 +137,17 @@ table inet filter {
         # return from mesh_input — but mesh_input always terminates.
 
         # Drop invalid conntrack state from mesh peers.
+        #
+        # BUG FIX (v4-01): rate-limit the log, split from the drop — a
+        # compromised or misbehaving peer inside the mesh should not be able
+        # to flood the log any more than a public-interface attacker can
+        # (see 30-established.nft and 10-antiscan.nft for the same pattern).
         ct state invalid \
+            limit rate 10/second burst 20 packets \
             log prefix "XNFT-MESH-INVALID: " level warn \
-            drop comment "mesh: conntrack invalid state"
+            comment "mesh: log conntrack invalid state (rate-limited)"
+        ct state invalid \
+            counter drop comment "mesh: conntrack invalid state"
 
         # Fast-path for established/related connections (e.g. long-lived SSH
         # sessions, streaming responses).  Must come after invalid-drop.
@@ -159,5 +191,18 @@ table inet filter {
             log prefix "XNFT-MESH-DENY: " level info \
             comment "mesh: log peer traffic to non-allowlisted port (rate-limited)"
         counter drop comment "mesh: peer port not in services allowlist, drop"
+    }
+
+    # Rate-limited log + unconditional drop for break-glass SSH offenders.
+    # Separate chain so the log's own rate limit can never gate the drop
+    # (see 10-antiscan.nft header for the pattern rationale) — same shape as
+    # ssh_ratelimit_drop in 40-services.nft and wg_ratelimit_drop in
+    # 50-vpn-endpoint.nft.  Per-source meter (BUG FIX v4-03) means only the
+    # offending source lands here; every other admin IP is unaffected.
+    chain breakglass_ratelimit_drop {
+        limit rate 6/minute burst 10 packets \
+            log prefix "XNFT-BREAKGLASS-RATELIMIT: " level warn \
+            comment "break-glass: log rate-limit excess (rate-limited)"
+        counter drop comment "break-glass: rate-limit exceeded"
     }
 }

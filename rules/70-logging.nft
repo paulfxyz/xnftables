@@ -52,9 +52,15 @@ table inet filter {
     chain forward {
         # BUG FIX (9A): must accept established/related forwarded connections
         # before the drop, otherwise WireGuard hub routing silently breaks.
+        # BUG FIX (v4-01): rate-limit the log, split from the drop — same
+        # attacker-reachable-log-flood class fixed in 30-established.nft and
+        # 20-mesh.nft.  Reachable by any node this host forwards for.
         ct state invalid \
+            limit rate 10/second burst 20 packets \
             log prefix "XNFT-FWD-INVALID: " level info \
-            drop comment "forward: drop invalid conntrack state"
+            comment "forward: log invalid conntrack state (rate-limited)"
+        ct state invalid \
+            counter drop comment "forward: drop invalid conntrack state"
 
         ct state { established, related } \
             accept comment "forward: established/related (hub routing)"
@@ -66,6 +72,18 @@ table inet filter {
         #   1. Uncomment the rule below
         #   2. sysctl -w net.ipv4.ip_forward=1  (persist in /etc/sysctl.d/)
         #   3. Reload and test peer-to-peer reachability through the hub
+        #
+        # NOTE (v4 audit, H-8): this template grants UNRESTRICTED peer-to-peer
+        # access between every member of @MESH_PEERS the moment it's enabled
+        # — there is no per-service allowlist equivalent for forwarded
+        # traffic, unlike 40-services.nft for host-terminated traffic. This is
+        # a deliberate scope decision (hub routing is opt-in and "mesh members
+        # trust each other" is a reasonable default for a small mesh), but it
+        # means a single compromised peer can reach every port on every other
+        # peer through the hub. If your mesh needs least-privilege between
+        # peers (not just between the internet and the mesh), add a
+        # per-service allowlist here mirroring 40-services.nft's pattern
+        # before enabling hub routing in production.
         # iifname "wg0" oifname "wg0" \
         #     ip saddr @MESH_PEERS ip daddr @MESH_PEERS \
         #     ct state new \

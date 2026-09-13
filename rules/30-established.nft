@@ -38,24 +38,75 @@ table inet filter {
         # "Invalid" means: RST outside a session, ACK with no SYN, overlapping
         # reassembly, etc.  These are common in port-scan noise and broken stacks.
         # Must come BEFORE the established/related accept below.
+        #
+        # BUG FIX (v4-01) — unrate-limited attacker-reachable log:
+        #   This is the single easiest log line in the whole ruleset to trigger
+        #   remotely — a bare stream of ACK/RST segments from ANY public source
+        #   is classified invalid, and every one used to emit an uncapped printk
+        #   line.  That violates the project's own stated invariant
+        #   (10-antiscan.nft: "every attacker-triggerable log is rate-limited in
+        #   a SEPARATE rule placed before an unconditional drop") and gave an
+        #   attacker a free disk-fill / journald-CPU / log-blinding primitive at
+        #   1M pps for the cost of their own bandwidth.  Log and drop are SPLIT
+        #   so the log's own rate limit can never gate the drop.
         ct state invalid \
+            limit rate 10/second burst 20 packets \
             log prefix "XNFT-INVALID: " level info \
-            drop comment "conntrack: drop invalid state (public iface)"
+            comment "conntrack: log invalid state (rate-limited, public iface)"
+        ct state invalid \
+            counter drop comment "conntrack: drop invalid state (public iface)"
 
         # Fast-path for already-accepted connections.
         # This prevents every reply packet from traversing the full chain.
         # On a moderately busy server this rule handles the vast majority of
         # inbound packets.
-        ct state { established, related } \
-            accept comment "conntrack: established/related fast-path (public iface)"
+        #
+        # BUG FIX (v4-04) — "related" was a conntrack-helper-shaped hole:
+        #   "related" is not just "ICMP errors for my flow" — it is ANY packet
+        #   matching a conntrack helper expectation (nf_conntrack_ftp/_sip/
+        #   _h323/_tftp/_irc/_pptp/_amanda).  On a kernel with
+        #   net.netfilter.nf_conntrack_helper=1 (the old default; still set on
+        #   some distro/cloud images), one outbound connection that a helper
+        #   latches onto (e.g. an FTP client, a SIP call) creates an
+        #   expectation, and this rule then accepted an inbound packet on a
+        #   port of the ATTACKER's choosing — before any service allowlist,
+        #   before 50-vpn-endpoint.nft, before 60-icmp.nft, before the
+        #   catch-all drop.  That is a direct hole in "if you are not inside
+        #   the mesh, you see nothing".  It also meant every ICMP hardening
+        #   rule in 60-icmp.nft was dead code for related-classified ICMP
+        #   errors (PMTUD-blackhole / connection-kill forgeries), since this
+        #   file is included before 60-icmp.nft and "established" accepts
+        #   first.
+        #   Fix: accept "established" unconditionally (safe — the flow was
+        #   already accepted once), but narrow "related" to the only
+        #   legitimate case on a hardened host: ICMP/ICMPv6 errors for a
+        #   tracked flow, rate-limited.  A helper expectation (or anything
+        #   else claiming "related") no longer matches either rule and falls
+        #   through to the 70-logging.nft catch-all — logged and dropped.
+        #   You must ALSO set net.netfilter.nf_conntrack_helper=0 (see
+        #   README.md → "Why nf_conntrack_helper must be disabled") — this
+        #   rule closes the accept-side hole but a helper module can still
+        #   attach expectations if left enabled.
+        ct state established \
+            accept comment "conntrack: established fast-path (public iface)"
+        meta l4proto { icmp, icmpv6 } ct state related \
+            limit rate 10/second burst 20 packets \
+            accept comment "conntrack: related ICMP/ICMPv6 errors only (rate-limited, public iface)"
     }
 
     chain output {
         # Drop invalid state on output too.
         # Without this, a compromised process could send RST/ACK-flood
         # packets that aren't part of any real session.
+        #
+        # BUG FIX (v4-01): same log/drop split as the input chain above —
+        # a locally-compromised process able to generate invalid-state output
+        # at high rate should not also get an uncapped log write.
         ct state invalid \
+            limit rate 10/second burst 20 packets \
             log prefix "XNFT-OUT-INVALID: " level info \
-            drop comment "conntrack: drop invalid state on output"
+            comment "conntrack: log invalid state on output (rate-limited)"
+        ct state invalid \
+            counter drop comment "conntrack: drop invalid state on output"
     }
 }
